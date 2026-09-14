@@ -1,0 +1,61 @@
+#!/bin/sh
+
+. /usr/libexec/camera-tracer/common.sh
+
+expected_generation="${1:-}"
+event_dir="${2:-}"
+duration="${3:-15}"
+
+ct_is_uint "$duration" || duration=15
+[ "$duration" -ge 1 ] 2>/dev/null || duration=1
+[ "$duration" -le 120 ] 2>/dev/null || duration=120
+
+sleep "$duration"
+
+current_generation="$(cat "$CT_BASE/generation" 2>/dev/null)"
+[ -n "$expected_generation" ] && [ "$current_generation" = "$expected_generation" ] || exit 0
+
+# A webcontrol-started audio event must be explicitly bounded. movie_max_time
+# also caps files, but eventend prevents Motion from creating further segments.
+ct_motion_action eventend || ct_log "failed to end forced audio video event"
+ct_audio_record_stop "$event_dir"
+
+# Normally on_movie_start has already consumed the pending marker and
+# on_movie_end will finalize the event. If no movie ever started, release the
+# marker and make sure an allowed event still reaches the local hook with its
+# photo rather than waiting forever for an MP4 that does not exist.
+sleep 3
+pending="$(ct_audio_pending_read 2>/dev/null || true)"
+pending_generation="$(printf '%s\n' "$pending" | sed -n '1p')"
+pending_dir="$(printf '%s\n' "$pending" | sed -n '2p')"
+[ "$pending_generation" = "$expected_generation" ] || exit 0
+[ "$pending_dir" = "$event_dir" ] || exit 0
+
+rm -f "$CT_BASE/audio-video-pending"
+
+ct_load_config
+config_get trusted_timeout main trusted_timeout '5'
+ct_is_uint "$trusted_timeout" || trusted_timeout=5
+decision="$(ct_state_read "$event_dir" decision 2>/dev/null || true)"
+wait_left=$((trusted_timeout + 5))
+while [ "$decision" = pending ] && [ "$wait_left" -gt 0 ]; do
+	sleep 1
+	wait_left=$((wait_left - 1))
+	decision="$(ct_state_read "$event_dir" decision 2>/dev/null || true)"
+done
+
+if [ "$decision" = allow ]; then
+	config_get hook_script main hook_script ''
+	photo="$(ct_state_read "$event_dir" photo 2>/dev/null || true)"
+	source_type="$(ct_state_read "$event_dir" source 2>/dev/null || true)"
+	trigger_epoch="$(ct_state_read "$event_dir" epoch 2>/dev/null || true)"
+	trigger_timestamp="$(ct_state_read "$event_dir" timestamp 2>/dev/null || true)"
+	[ -n "$source_type" ] || source_type='audio'
+	[ -n "$trigger_epoch" ] || trigger_epoch="$(date +%s)"
+	[ -n "$trigger_timestamp" ] || trigger_timestamp="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+	ct_log "audio event produced no MP4; finalizing hook with photo only"
+	ct_call_hook "$hook_script" "$source_type" "$photo" '' "$trigger_epoch" "$trigger_timestamp" || true
+fi
+
+rm -rf "$event_dir"
+exit 0

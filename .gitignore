@@ -1,0 +1,17 @@
+# Locally built OpenWrt package artifacts
+*.apk
+*.ipk
+
+# Archives/releases
+*.tar.gz
+*.zip
+
+# Editor / OS files
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Local scratch files
+.tmp/
+tmp/

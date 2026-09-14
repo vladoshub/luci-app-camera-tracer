@@ -1,0 +1,14 @@
+{
+	"luci-app-camera-tracer": {
+		"description": "Grant access to Camera Tracer configuration and device discovery",
+		"read": {
+			"uci": [ "camera_tracer", "dhcp" ],
+			"file": {
+				"/usr/libexec/camera-tracer/luci-helper": [ "exec" ]
+			}
+		},
+		"write": {
+			"uci": [ "camera_tracer" ]
+		}
+	}
+}

@@ -1,0 +1,172 @@
+#!/bin/sh
+
+. /usr/libexec/camera-tracer/common.sh
+
+source_type="${1:-}"
+input_photo="${2:-}"
+event_id="${3:-}"
+
+case "$source_type" in
+	video|audio) ;;
+	*) exit 2 ;;
+esac
+
+ct_load_config
+config_get_bool enabled main enabled 0
+[ "$enabled" -eq 1 ] || exit 0
+ct_get_trusted_ips
+
+# The snapshot created for an audio trigger also passes through Motion's
+# on_picture_save hook. Ignore it there; the audio branch below owns it.
+if [ "$source_type" = video ]; then
+	case "${input_photo##*/}" in
+		audio-snapshot.jpg|lastsnap.jpg) exit 0 ;;
+	esac
+	[ -f "$input_photo" ] || exit 0
+fi
+
+if ! ct_reserve_event; then
+	[ "$source_type" = video ] && rm -f "$input_photo"
+	exit 0
+fi
+
+config_get photo_name main photo_name 'last.jpg'
+if ! ct_safe_photo_name "$photo_name"; then
+	ct_log "invalid photo_name '$photo_name', using last.jpg"
+	photo_name='last.jpg'
+fi
+
+if [ "$source_type" = audio ]; then
+	if [ ! -x /usr/bin/arecord ]; then
+		ct_log "audio trigger requested but alsa-utils/arecord is not installed"
+		exit 1
+	fi
+	rm -f "$CT_RAW/audio-snapshot.jpg" "$CT_RAW/lastsnap.jpg"
+	if ! ct_motion_action snapshot; then
+		ct_log "audio trigger accepted but Motion snapshot request failed"
+		exit 1
+	fi
+	input_photo="$CT_RAW/audio-snapshot.jpg"
+	if [ ! -f "$input_photo" ]; then
+		sleep 1
+	fi
+	[ -f "$input_photo" ] || {
+		ct_log "audio trigger accepted but snapshot file was not created"
+		exit 1
+	}
+fi
+
+final_photo="$CT_BASE/$photo_name"
+tmp_photo="$CT_BASE/.${photo_name}.tmp.$$"
+
+if ! cp "$input_photo" "$tmp_photo" 2>/dev/null; then
+	ct_log "failed to copy trigger image from $input_photo"
+	[ "$source_type" = video ] && rm -f "$input_photo"
+	exit 1
+fi
+mv -f "$tmp_photo" "$final_photo"
+
+case "$input_photo" in
+	"$CT_RAW"/*) rm -f "$input_photo" ;;
+esac
+
+trigger_timestamp="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+generation="$(cat "$CT_BASE/generation" 2>/dev/null)"
+[ -n "$generation" ] || exit 0
+
+event_dir=''
+config_get_bool video_enabled main video_enabled 0
+config_get_bool video_audio_enabled main video_audio_enabled 0
+[ "$video_enabled" -eq 1 ] || video_audio_enabled=0
+state_id=''
+if [ "$video_enabled" -eq 1 ]; then
+	case "$source_type" in
+		video)
+			ct_is_uint "$event_id" && state_id="$event_id"
+			;;
+		audio)
+			# Motion does not expose the new event id to the webcontrol caller.
+			# Use the trigger epoch for Camera Tracer state and bind it to the
+			# Motion event id later from on_movie_start.
+			state_id="$CT_TRIGGER_EPOCH"
+			;;
+	esac
+fi
+
+if [ -n "$state_id" ]; then
+	event_dir="$(ct_event_dir "$generation" "$state_id")" || event_dir=''
+	if [ -n "$event_dir" ]; then
+		mkdir -p "$event_dir"
+		ct_state_write "$event_dir" generation "$generation"
+		ct_state_write "$event_dir" source "$source_type"
+		ct_state_write "$event_dir" photo "$final_photo"
+		ct_state_write "$event_dir" epoch "$CT_TRIGGER_EPOCH"
+		ct_state_write "$event_dir" timestamp "$trigger_timestamp"
+		ct_state_write "$event_dir" decision 'pending'
+
+		# Optional microphone audio is captured by the single long-lived ALSA
+		# worker. The event only toggles which accepted state directory receives
+		# PCM bytes, so audio threshold detection and clip recording never need to
+		# open the USB microphone twice.
+		if [ "$video_audio_enabled" -eq 1 ]; then
+			config_get audio_sample_rate main audio_sample_rate '16000'
+			case "$audio_sample_rate" in
+				8000|16000|32000|44100|48000) ;;
+				*) audio_sample_rate=16000 ;;
+			esac
+			config_get video_audio_bitrate_kbps main video_audio_bitrate_kbps '64'
+			ct_is_uint "$video_audio_bitrate_kbps" || video_audio_bitrate_kbps=64
+			[ "$video_audio_bitrate_kbps" -ge 16 ] 2>/dev/null || video_audio_bitrate_kbps=16
+			[ "$video_audio_bitrate_kbps" -le 192 ] 2>/dev/null || video_audio_bitrate_kbps=192
+
+			config_get fps main fps '5'
+			config_get video_pre_capture_frames main video_pre_capture_frames '2'
+			ct_is_uint "$fps" || fps=5
+			[ "$fps" -ge 1 ] 2>/dev/null || fps=5
+			ct_is_uint "$video_pre_capture_frames" || video_pre_capture_frames=0
+			audio_delay_ms=$(((video_pre_capture_frames * 1000 + fps - 1) / fps))
+
+			ct_state_write "$event_dir" record_audio '1'
+			ct_state_write "$event_dir" audio_sample_rate "$audio_sample_rate"
+			ct_state_write "$event_dir" audio_bitrate_kbps "$video_audio_bitrate_kbps"
+			ct_state_write "$event_dir" audio_delay_ms "$audio_delay_ms"
+
+			if [ -r "$CT_BASE/audio-worker-ready" ]; then
+				if ct_audio_record_start "$generation" "$event_dir"; then
+					ct_log "started microphone capture for $source_type event"
+				else
+					ct_log "could not arm microphone capture for event"
+				fi
+			else
+				ct_log "MP4 audio requested but audio worker is unavailable; continuing with video-only clip"
+			fi
+		fi
+	fi
+fi
+
+# Audio is a first-class trigger. With video enabled, force Motion to start an
+# event after the immediate snapshot has been captured. on_movie_start binds
+# Motion's generated event id back to this Camera Tracer event. A separate
+# worker forcibly ends the event so continuous sound can never record forever.
+if [ "$source_type" = audio ] && [ "$video_enabled" -eq 1 ] && [ -n "$event_dir" ]; then
+	config_get video_max_time main video_max_time '15'
+	ct_is_uint "$video_max_time" || video_max_time=15
+	[ "$video_max_time" -ge 1 ] 2>/dev/null || video_max_time=1
+	[ "$video_max_time" -le 120 ] 2>/dev/null || video_max_time=120
+
+	if ct_audio_pending_write "$generation" "$event_dir" && ct_motion_action eventstart; then
+		/usr/libexec/camera-tracer/audio-video-stop \
+			"$generation" "$event_dir" "$video_max_time" >/dev/null 2>&1 &
+	else
+		ct_log "audio trigger accepted but Motion video event could not be started; continuing with photo only"
+		ct_audio_record_stop "$event_dir"
+		rm -f "$CT_BASE/audio-video-pending"
+		rm -rf "$event_dir"
+		event_dir=''
+	fi
+fi
+
+ct_log "accepted $source_type trigger; photo=$final_photo holdoff=${CT_HOLDOFF}s event=${event_id:-none}"
+/usr/libexec/camera-tracer/process-event \
+	"$source_type" "$final_photo" "$CT_TRIGGER_EPOCH" "$trigger_timestamp" "$generation" "$event_dir" >/dev/null 2>&1 &
+exit 0

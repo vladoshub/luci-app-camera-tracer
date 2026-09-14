@@ -1,0 +1,80 @@
+#!/bin/sh
+
+case "${1:-}" in
+	cameras)
+		for dev in /dev/video*; do
+			[ -c "$dev" ] || continue
+			if command -v v4l2-ctl >/dev/null 2>&1; then
+				# UVC devices can expose extra metadata / codec nodes. Only show
+				# nodes that advertise an actual capture capability.
+				v4l2-ctl -d "$dev" -D 2>/dev/null | \
+					grep -Eq 'Video Capture|Video Capture Multiplanar' || continue
+			fi
+			name="$(cat "/sys/class/video4linux/${dev##*/}/name" 2>/dev/null)"
+			[ -n "$name" ] || name="${dev##*/}"
+			printf '%s\t%s\n' "$dev" "$name"
+		done
+		;;
+
+	resolutions)
+		for dev in /dev/video*; do
+			[ -c "$dev" ] || continue
+			command -v v4l2-ctl >/dev/null 2>&1 || continue
+			v4l2-ctl -d "$dev" --list-formats-ext 2>/dev/null | \
+				sed -n 's/^[[:space:]]*Size: Discrete \([0-9][0-9]*x[0-9][0-9]*\).*/\1/p' | \
+				sort -u | while IFS= read -r size; do
+					[ -n "$size" ] && printf '%s\t%s\n' "$dev" "$size"
+				done
+		done
+		;;
+
+	dhcp)
+		# Output: IP<TAB>label. Static reservations are emitted first and are
+		# authoritative; active leases fill in devices without a static host.
+		{
+			if command -v uci >/dev/null 2>&1; then
+				for section in $(uci -q show dhcp 2>/dev/null | sed -n 's/^dhcp\.\([^=]*\)=host$/\1/p'); do
+					ip="$(uci -q get "dhcp.$section.ip" 2>/dev/null)"
+					[ -n "$ip" ] || continue
+					name="$(uci -q get "dhcp.$section.name" 2>/dev/null)"
+					[ -n "$name" ] || name="$(uci -q get "dhcp.$section.hostname" 2>/dev/null)"
+					mac="$(uci -q get "dhcp.$section.mac" 2>/dev/null | awk '{print $1}')"
+					label="static DHCP"
+					[ -n "$name" ] && label="$label — $name"
+					[ -n "$mac" ] && label="$label ($mac)"
+					printf '%s\t%s\n' "$ip" "$label"
+				done
+			fi
+
+			leasefile="$(uci -q get 'dhcp.@dnsmasq[0].leasefile' 2>/dev/null)"
+			[ -n "$leasefile" ] || leasefile='/tmp/dhcp.leases'
+			if [ -r "$leasefile" ]; then
+				awk '{
+					ip=$3; mac=$2; name=$4;
+					if (ip == "") next;
+					label="active lease";
+					if (name != "" && name != "*") label=label " — " name;
+					if (mac != "") label=label " (" mac ")";
+					print ip "\t" label;
+				}' "$leasefile"
+			fi
+		} | awk -F '\t' '!seen[$1]++ { print }'
+		;;
+
+	audio)
+		[ -r /proc/asound/pcm ] || exit 0
+		awk -F: '/capture/ {
+			split($1, a, "-");
+			card = a[1] + 0;
+			dev = a[2] + 0;
+			label = $2;
+			gsub(/^[ \t]+|[ \t]+$/, "", label);
+			printf "plughw:%d,%d\t%s\n", card, dev, label;
+		}' /proc/asound/pcm
+		;;
+
+	*)
+		echo "usage: $0 {cameras|resolutions|dhcp|audio}" >&2
+		exit 2
+		;;
+esac

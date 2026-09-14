@@ -1,0 +1,20 @@
+name: static-check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  static-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y busybox make python3
+
+      - name: Run static checks
+        run: ./tests/static-check.sh

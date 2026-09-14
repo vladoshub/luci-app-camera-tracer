@@ -1,0 +1,210 @@
+#!/bin/sh
+
+. /usr/libexec/camera-tracer/common.sh
+
+ct_load_config
+config_get_bool audio_enabled main audio_enabled 0
+config_get_bool video_enabled main video_enabled 0
+config_get_bool video_audio_enabled main video_audio_enabled 0
+config_get audio_device main audio_device ''
+config_get audio_sample_rate main audio_sample_rate '16000'
+config_get threshold_db main audio_threshold_db '-24'
+config_get trigger_ms main audio_trigger_ms '250'
+
+[ "$video_enabled" -eq 1 ] || video_audio_enabled=0
+if [ "$audio_enabled" -ne 1 ] && [ "$video_audio_enabled" -ne 1 ]; then
+	exit 0
+fi
+
+[ -n "$audio_device" ] || {
+	ct_log "audio capture required but no capture device selected"
+	exit 1
+}
+
+case "$audio_sample_rate" in
+	8000|16000|32000|44100|48000) ;;
+	*) audio_sample_rate=16000 ;;
+esac
+
+if ! awk -v v="$threshold_db" 'BEGIN {
+	if (v !~ /^-?[0-9]+([.][0-9]+)?$/) exit 1;
+	v += 0;
+	exit (v >= -96 && v <= 0) ? 0 : 1;
+}' </dev/null; then
+	threshold_db='-24'
+fi
+
+ct_is_uint "$trigger_ms" || trigger_ms=250
+[ "$trigger_ms" -ge 50 ] 2>/dev/null || trigger_ms=50
+[ "$trigger_ms" -le 5000 ] 2>/dev/null || trigger_ms=5000
+
+ct_log "starting audio capture: device=$audio_device rate=${audio_sample_rate}Hz trigger=$audio_enabled record_in_video=$video_audio_enabled threshold=${threshold_db}dBFS trigger_ms=${trigger_ms}"
+
+# Open the ALSA capture device exactly once. When both threshold detection and
+# MP4 audio are enabled, BusyBox tee duplicates the raw S16_LE stream to the
+# detector and to a small recording sink. This avoids relying on an ALSA device
+# supporting two simultaneous capture opens.
+mkdir -p "$CT_BASE"
+PCM_FIFO="$CT_BASE/audio-pcm.$$"
+ANALYZE_FIFO="$CT_BASE/audio-analyze.$$"
+RECORD_FIFO="$CT_BASE/audio-record.$$"
+TEXT_FIFO="$CT_BASE/audio-text.$$"
+ARECORD_PID=''
+TEE_PID=''
+DUMP_PID=''
+AWK_PID=''
+RECORD_PID=''
+
+cleanup_audio() {
+	trap - TERM INT EXIT
+	for pid in "$ARECORD_PID" "$TEE_PID" "$DUMP_PID" "$AWK_PID" "$RECORD_PID"; do
+		[ -n "$pid" ] || continue
+		kill "$pid" 2>/dev/null || true
+	done
+	for pid in "$ARECORD_PID" "$TEE_PID" "$DUMP_PID" "$AWK_PID" "$RECORD_PID"; do
+		[ -n "$pid" ] || continue
+		wait "$pid" 2>/dev/null || true
+	done
+	rm -f "$PCM_FIFO" "$ANALYZE_FIFO" "$RECORD_FIFO" "$TEXT_FIFO"
+	if [ -r "$CT_BASE/audio-worker-ready" ] && [ "$(cat "$CT_BASE/audio-worker-ready" 2>/dev/null)" = "$$" ]; then
+		rm -f "$CT_BASE/audio-worker-ready"
+	fi
+}
+
+trap 'cleanup_audio; exit 0' TERM INT
+trap cleanup_audio EXIT
+
+rm -f "$PCM_FIFO" "$ANALYZE_FIFO" "$RECORD_FIFO" "$TEXT_FIFO"
+mkfifo "$PCM_FIFO" || {
+	ct_log "failed to create audio PCM FIFO"
+	exit 1
+}
+
+window_ms=50
+window_samples=$((audio_sample_rate / 20))
+window_bytes=$((window_samples * 2))
+record_chunk_bytes=$((audio_sample_rate * 2 / 10))
+[ "$record_chunk_bytes" -gt 0 ] || record_chunk_bytes=3200
+
+if [ "$audio_enabled" -eq 1 ]; then
+	mkfifo "$ANALYZE_FIFO" "$TEXT_FIFO" || {
+		ct_log "failed to create audio analyzer FIFOs"
+		exit 1
+	}
+
+	awk -v threshold="$threshold_db" -v trigger_ms="$trigger_ms" -v window_ms="$window_ms" '
+BEGIN {
+	needed = int((trigger_ms + window_ms - 1) / window_ms);
+	if (needed < 1) needed = 1;
+	above = 0;
+	cooldown = 0;
+	ln10 = log(10);
+}
+{
+	sum = 0;
+	n = 0;
+	for (i = 1; i <= NF; i++) {
+		v = $i + 0;
+		sum += v * v;
+		n++;
+	}
+	if (n == 0) next;
+
+	rms = sqrt(sum / n);
+	if (rms < 1) db = -96;
+	else db = 20 * log(rms / 32768) / ln10;
+
+	if (cooldown > 0) {
+		cooldown--;
+		above = 0;
+		next;
+	}
+
+	if (db >= threshold) above++;
+	else above = 0;
+
+	if (above >= needed) {
+		system("/usr/libexec/camera-tracer/event audio >/dev/null 2>&1 &");
+		above = 0;
+		# One second local debounce. The global event lock is authoritative.
+		cooldown = int(1000 / window_ms);
+	}
+}
+' < "$TEXT_FIFO" &
+	AWK_PID=$!
+
+	if command -v hexdump >/dev/null 2>&1; then
+		dump_format="${window_samples}/2 \"%d \" \"\\n\""
+		hexdump -v -e "$dump_format" < "$ANALYZE_FIFO" > "$TEXT_FIFO" &
+	elif command -v od >/dev/null 2>&1; then
+		od -An -v -t d2 -w"$window_bytes" < "$ANALYZE_FIFO" > "$TEXT_FIFO" &
+	else
+		ct_log "audio detection requires BusyBox hexdump or GNU od"
+		exit 1
+	fi
+	DUMP_PID=$!
+fi
+
+if [ "$video_audio_enabled" -eq 1 ]; then
+	mkfifo "$RECORD_FIFO" || {
+		ct_log "failed to create audio recording FIFO"
+		exit 1
+	}
+
+	(
+		chunk="$CT_BASE/.audio-chunk.$$"
+		exec 3< "$RECORD_FIFO"
+		trap 'rm -f "$chunk"; exit 0' TERM INT EXIT
+		while :; do
+			rm -f "$chunk"
+			dd of="$chunk" bs="$record_chunk_bytes" count=1 <&3 2>/dev/null || true
+			bytes="$(wc -c < "$chunk" 2>/dev/null | tr -d '[:space:]')"
+			ct_is_uint "$bytes" || bytes=0
+			[ "$bytes" -gt 0 ] || break
+
+			active="$(ct_audio_record_active_read 2>/dev/null || true)"
+			active_generation="$(printf '%s\n' "$active" | sed -n '1p')"
+			active_dir="$(printf '%s\n' "$active" | sed -n '2p')"
+			current_generation="$(cat "$CT_BASE/generation" 2>/dev/null)"
+			case "$active_dir" in
+				"$CT_STATE/$active_generation/"*) ;;
+				*) active_dir='' ;;
+			esac
+
+			if [ -n "$active_dir" ] && [ "$active_generation" = "$current_generation" ] && [ -d "$active_dir" ]; then
+				cat "$chunk" >> "$active_dir/audio.pcm" 2>/dev/null || true
+			fi
+		done
+	) &
+	RECORD_PID=$!
+fi
+
+# Readers must be running before the producer opens the FIFO.
+if [ "$audio_enabled" -eq 1 ] && [ "$video_audio_enabled" -eq 1 ]; then
+	command -v tee >/dev/null 2>&1 || {
+		ct_log "simultaneous audio trigger + MP4 audio requires BusyBox tee"
+		exit 1
+	}
+	tee "$ANALYZE_FIFO" < "$PCM_FIFO" > "$RECORD_FIFO" &
+	TEE_PID=$!
+elif [ "$audio_enabled" -eq 1 ]; then
+	# Feed the detector directly.
+	cat "$PCM_FIFO" > "$ANALYZE_FIFO" &
+	TEE_PID=$!
+elif [ "$video_audio_enabled" -eq 1 ]; then
+	# Feed the recording sink directly.
+	cat "$PCM_FIFO" > "$RECORD_FIFO" &
+	TEE_PID=$!
+fi
+
+printf '%s\n' "$$" > "$CT_BASE/audio-worker-ready"
+
+/usr/bin/arecord -q -D "$audio_device" -f S16_LE -c 1 -r "$audio_sample_rate" -t raw \
+	> "$PCM_FIFO" 2>/dev/null &
+ARECORD_PID=$!
+
+# arecord is the source. When it exits unexpectedly, procd restarts this worker;
+# EXIT cleanup terminates every downstream stage first.
+wait "$ARECORD_PID"
+rc=$?
+exit "$rc"

@@ -1,0 +1,13 @@
+{
+	"admin/services/camera_tracer": {
+		"title": "Camera Tracer",
+		"order": 75,
+		"action": {
+			"type": "view",
+			"path": "camera_tracer/settings"
+		},
+		"depends": {
+			"acl": [ "luci-app-camera-tracer" ]
+		}
+	}
+}

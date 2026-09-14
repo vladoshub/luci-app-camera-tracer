@@ -1,0 +1,70 @@
+#!/bin/sh /etc/rc.common
+
+USE_PROCD=1
+START=95
+STOP=10
+
+start_service() {
+	local enabled audio_enabled video_enabled video_audio_enabled need_audio
+
+	config_load camera_tracer
+	config_get_bool enabled main enabled 0
+	[ "$enabled" -eq 1 ] || return 0
+
+	mkdir -p /tmp/camera_tracer/raw /tmp/camera_tracer/state
+	rm -f /tmp/camera_tracer/reserve.lock /tmp/camera_tracer/next_allowed \
+		/tmp/camera_tracer/audio-video-pending /tmp/camera_tracer/audio-record-active \
+		/tmp/camera_tracer/audio-worker-ready
+	rm -rf /tmp/camera_tracer/audio-video-bind.lock \
+		/tmp/camera_tracer/audio-record-control.lock
+	rm -rf /tmp/camera_tracer/state/*
+	printf '%s-%s\n' "$(date +%s)" "$$" > /tmp/camera_tracer/generation
+
+	procd_open_instance motion
+	procd_set_param command /usr/libexec/camera-tracer/run-motion
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+
+	config_get_bool audio_enabled main audio_enabled 0
+	config_get_bool video_enabled main video_enabled 0
+	config_get_bool video_audio_enabled main video_audio_enabled 0
+	[ "$video_enabled" -eq 1 ] || video_audio_enabled=0
+	need_audio=0
+	if [ "$audio_enabled" -eq 1 ] || [ "$video_audio_enabled" -eq 1 ]; then
+		need_audio=1
+	fi
+
+	if [ "$need_audio" -eq 1 ]; then
+		if [ ! -x /usr/bin/arecord ]; then
+			logger -t camera-tracer "audio capture requested but alsa-utils/arecord is not installed; audio worker not started"
+		elif [ ! -r /proc/asound/pcm ]; then
+			logger -t camera-tracer "audio capture requested but no ALSA capture devices are available; audio worker not started"
+		else
+			if [ "$video_audio_enabled" -eq 1 ] && ! command -v ffmpeg >/dev/null 2>&1; then
+				logger -t camera-tracer "MP4 audio enabled but ffmpeg CLI is not installed; clips will fall back to video-only"
+			fi
+			procd_open_instance audio
+			procd_set_param command /usr/libexec/camera-tracer/run-audio
+			procd_set_param respawn 3600 5 5
+			procd_set_param stdout 1
+			procd_set_param stderr 1
+			procd_close_instance
+		fi
+	fi
+}
+
+stop_service() {
+	rm -f /tmp/camera_tracer/generation /tmp/camera_tracer/audio-record-active \
+		/tmp/camera_tracer/audio-worker-ready
+}
+
+reload_service() {
+	stop
+	start
+}
+
+service_triggers() {
+	procd_add_reload_trigger camera_tracer
+}

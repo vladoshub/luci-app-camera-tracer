@@ -1,0 +1,105 @@
+#!/bin/sh
+
+. /usr/libexec/camera-tracer/common.sh
+
+ct_load_config
+
+config_get video_device main video_device '/dev/video0'
+config_get resolution main resolution '640x480'
+config_get fps main fps '5'
+config_get threshold main video_threshold '1500'
+config_get_bool audio_enabled main audio_enabled 0
+config_get_bool video_enabled main video_enabled 0
+config_get video_max_time main video_max_time '15'
+config_get video_pre_capture_frames main video_pre_capture_frames '2'
+config_get video_post_capture_seconds main video_post_capture_seconds '5'
+config_get video_quality main video_quality '60'
+
+case "$video_device" in
+	/dev/video[0-9]*) ;;
+	*) ct_log "invalid video device: $video_device"; exit 1 ;;
+esac
+
+width="${resolution%x*}"
+height="${resolution#*x}"
+if ! ct_is_uint "$width" || ! ct_is_uint "$height" || [ "$width" -lt 16 ] || [ "$height" -lt 16 ]; then
+	width=640
+	height=480
+fi
+ct_is_uint "$fps" || fps=5
+[ "$fps" -ge 1 ] 2>/dev/null || fps=5
+[ "$fps" -le 60 ] 2>/dev/null || fps=60
+ct_is_uint "$threshold" || threshold=1500
+
+ct_is_uint "$video_max_time" || video_max_time=15
+[ "$video_max_time" -ge 1 ] 2>/dev/null || video_max_time=1
+[ "$video_max_time" -le 120 ] 2>/dev/null || video_max_time=120
+
+ct_is_uint "$video_pre_capture_frames" || video_pre_capture_frames=2
+[ "$video_pre_capture_frames" -le 5 ] 2>/dev/null || video_pre_capture_frames=5
+
+ct_is_uint "$video_post_capture_seconds" || video_post_capture_seconds=5
+[ "$video_post_capture_seconds" -le 30 ] 2>/dev/null || video_post_capture_seconds=30
+post_capture_frames=$((video_post_capture_seconds * fps))
+
+if [ "$video_enabled" -ne 1 ]; then
+	video_pre_capture_frames=0
+	post_capture_frames=0
+fi
+
+ct_is_uint "$video_quality" || video_quality=60
+[ "$video_quality" -ge 1 ] 2>/dev/null || video_quality=1
+[ "$video_quality" -le 100 ] 2>/dev/null || video_quality=100
+
+mkdir -p "$CT_RAW" "$CT_STATE"
+rm -f "$CT_RAW"/trigger-*.jpg "$CT_RAW"/audio-snapshot.jpg "$CT_RAW"/lastsnap.jpg "$CT_RAW"/clip-*.mp4
+
+webcontrol_port=0
+webcontrol_parms=0
+if [ "$audio_enabled" -eq 1 ]; then
+	webcontrol_port="$CT_WEBCONTROL_PORT"
+	webcontrol_parms=1
+fi
+
+movie_output=off
+if [ "$video_enabled" -eq 1 ]; then
+	movie_output=on
+fi
+
+cat > "$CT_BASE/motion.conf" <<EOF_CONF
+daemon off
+setup_mode off
+log_level 5
+pid_file $CT_BASE/motion.pid
+target_dir $CT_RAW
+video_device $video_device
+width $width
+height $height
+framerate $fps
+threshold $threshold
+minimum_motion_frames 2
+event_gap 1
+pre_capture $video_pre_capture_frames
+post_capture $post_capture_frames
+picture_output first
+picture_type jpeg
+picture_quality 85
+picture_filename trigger-%v-%Y%m%d-%H%M%S-%q
+snapshot_interval 0
+snapshot_filename audio-snapshot
+movie_output $movie_output
+movie_codec mp4:mpeg4
+movie_quality $video_quality
+movie_max_time $video_max_time
+movie_filename clip-%v-%Y%m%d-%H%M%S
+on_picture_save /usr/libexec/camera-tracer/event video %f %v
+on_movie_start /usr/libexec/camera-tracer/movie-start %f %v
+on_movie_end /usr/libexec/camera-tracer/movie-end %f %v
+webcontrol_port $webcontrol_port
+webcontrol_localhost on
+webcontrol_interface 1
+webcontrol_parms $webcontrol_parms
+EOF_CONF
+
+ct_log "starting Motion: device=$video_device resolution=${width}x${height} fps=$fps threshold=$threshold video=$movie_output max=${video_max_time}s pre=${video_pre_capture_frames}f post=${video_post_capture_seconds}s"
+exec /usr/bin/motion -n -c "$CT_BASE/motion.conf"

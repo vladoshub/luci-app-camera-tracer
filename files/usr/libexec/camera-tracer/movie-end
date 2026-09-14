@@ -1,0 +1,227 @@
+#!/bin/sh
+
+. /usr/libexec/camera-tracer/common.sh
+
+raw_movie="${1:-}"
+event_id="${2:-}"
+
+[ -f "$raw_movie" ] || exit 0
+ct_is_uint "$event_id" || {
+	ct_log "movie closed with invalid event id; deleting raw movie: $raw_movie"
+	rm -f "$raw_movie"
+	exit 0
+}
+
+ct_load_config
+config_get_bool video_enabled main video_enabled 0
+[ "$video_enabled" -eq 1 ] || {
+	rm -f "$raw_movie"
+	exit 0
+}
+
+generation="$(cat "$CT_BASE/generation" 2>/dev/null)"
+[ -n "$generation" ] || {
+	rm -f "$raw_movie"
+	exit 0
+}
+
+event_dir="$(ct_event_dir "$generation" "$event_id" 2>/dev/null)" || event_dir=''
+map_file="$CT_STATE/$generation/map-$event_id"
+
+if [ -z "$event_dir" ] || [ ! -d "$event_dir" ]; then
+	# Audio-triggered recording is started through Motion webcontrol. Its Motion
+	# event id is learned asynchronously by on_movie_start and mapped back to
+	# the Camera Tracer event state here.
+	event_dir=''
+	if [ -r "$map_file" ]; then
+		mapped_dir="$(cat "$map_file" 2>/dev/null)"
+		case "$mapped_dir" in
+			"$CT_STATE/$generation/"*) [ -d "$mapped_dir" ] && event_dir="$mapped_dir" ;;
+		esac
+	fi
+fi
+
+[ -n "$event_dir" ] && [ -d "$event_dir" ] || {
+	# This movie belongs to a Motion event that Camera Tracer did not accept
+	# (typically because the global holdoff was active).
+	rm -f "$raw_movie" "$map_file"
+	exit 0
+}
+
+# If movie_max_time splits a long Motion event into multiple files, accept only
+# the first completed segment for this Camera Tracer event.
+if ! mkdir "$event_dir/finalize.lock" 2>/dev/null; then
+	rm -f "$raw_movie"
+	exit 0
+fi
+
+# Stop appending microphone PCM exactly when the accepted Motion segment closes.
+# The sink checks the marker between bounded chunks, so no second ALSA open is
+# needed and any tiny tail beyond movie close is naturally discarded by muxing.
+ct_audio_record_stop "$event_dir"
+
+config_get trusted_timeout main trusted_timeout '5'
+ct_is_uint "$trusted_timeout" || trusted_timeout=5
+wait_left=$((trusted_timeout + 5))
+decision="$(ct_state_read "$event_dir" decision 2>/dev/null || true)"
+while [ "$decision" = pending ] && [ "$wait_left" -gt 0 ]; do
+	sleep 1
+	wait_left=$((wait_left - 1))
+	decision="$(ct_state_read "$event_dir" decision 2>/dev/null || true)"
+done
+
+case "$decision" in
+	allow) ;;
+	suppress)
+		ct_log "discarding video for suppressed event $event_id"
+		rm -f "$raw_movie" "$map_file"
+		rm -rf "$event_dir"
+		exit 0
+		;;
+	*)
+		ct_log "discarding video for event $event_id because trusted-device decision was not completed"
+		rm -f "$raw_movie" "$map_file"
+		rm -rf "$event_dir"
+		exit 0
+		;;
+esac
+
+photo="$(ct_state_read "$event_dir" photo 2>/dev/null || true)"
+source_type="$(ct_state_read "$event_dir" source 2>/dev/null || true)"
+trigger_epoch="$(ct_state_read "$event_dir" epoch 2>/dev/null || true)"
+trigger_timestamp="$(ct_state_read "$event_dir" timestamp 2>/dev/null || true)"
+[ -n "$source_type" ] || source_type='video'
+[ -n "$trigger_epoch" ] || trigger_epoch="$(date +%s)"
+[ -n "$trigger_timestamp" ] || trigger_timestamp="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+
+config_get video_name main video_name 'last.mp4'
+if ! ct_safe_video_name "$video_name"; then
+	ct_log "invalid video_name '$video_name', using last.mp4"
+	video_name='last.mp4'
+fi
+
+config_get video_max_size_mb main video_max_size_mb '32'
+ct_is_uint "$video_max_size_mb" || video_max_size_mb=32
+[ "$video_max_size_mb" -ge 1 ] 2>/dev/null || video_max_size_mb=1
+[ "$video_max_size_mb" -le 256 ] 2>/dev/null || video_max_size_mb=256
+max_bytes=$((video_max_size_mb * 1024 * 1024))
+raw_bytes="$(wc -c < "$raw_movie" 2>/dev/null | tr -d '[:space:]')"
+ct_is_uint "$raw_bytes" || raw_bytes=0
+
+final_video=''
+mux_movie=''
+source_movie="$raw_movie"
+
+if [ "$raw_bytes" -gt "$max_bytes" ]; then
+	ct_log "video for event $event_id is ${raw_bytes} bytes and already exceeds ${video_max_size_mb} MiB limit; dropping video"
+	rm -f "$raw_movie"
+else
+	record_audio="$(ct_state_read "$event_dir" record_audio 2>/dev/null || true)"
+	audio_pcm="$event_dir/audio.pcm"
+
+	if [ "$record_audio" = '1' ] && [ -s "$audio_pcm" ]; then
+		audio_sample_rate="$(ct_state_read "$event_dir" audio_sample_rate 2>/dev/null || true)"
+		case "$audio_sample_rate" in
+			8000|16000|32000|44100|48000) ;;
+			*) audio_sample_rate=16000 ;;
+		esac
+
+		audio_bitrate_kbps="$(ct_state_read "$event_dir" audio_bitrate_kbps 2>/dev/null || true)"
+		ct_is_uint "$audio_bitrate_kbps" || audio_bitrate_kbps=64
+		[ "$audio_bitrate_kbps" -ge 16 ] 2>/dev/null || audio_bitrate_kbps=16
+		[ "$audio_bitrate_kbps" -le 192 ] 2>/dev/null || audio_bitrate_kbps=192
+
+		audio_delay_ms="$(ct_state_read "$event_dir" audio_delay_ms 2>/dev/null || true)"
+		ct_is_uint "$audio_delay_ms" || audio_delay_ms=0
+		audio_delay_sec="$(awk -v ms="$audio_delay_ms" 'BEGIN { printf "%.3f", ms / 1000 }')"
+
+		if command -v ffmpeg >/dev/null 2>&1; then
+			mux_movie="$CT_RAW/.mux-${event_id}-$$.mp4"
+			rm -f "$mux_movie"
+			if ffmpeg -nostdin -hide_banner -loglevel error -y \
+				-i "$raw_movie" \
+				-itsoffset "$audio_delay_sec" -f s16le -ar "$audio_sample_rate" -ac 1 -i "$audio_pcm" \
+				-map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a "${audio_bitrate_kbps}k" \
+				-shortest -movflags +faststart "$mux_movie"; then
+				if [ -s "$mux_movie" ]; then
+					source_movie="$mux_movie"
+					ct_log "muxed microphone audio into event $event_id MP4: rate=${audio_sample_rate}Hz bitrate=${audio_bitrate_kbps}k delay=${audio_delay_ms}ms"
+				else
+					ct_log "ffmpeg produced an empty audio/video MP4 for event $event_id; using video-only clip"
+					rm -f "$mux_movie"
+					mux_movie=''
+				fi
+			else
+				ct_log "ffmpeg could not mux microphone audio for event $event_id; using video-only clip"
+				rm -f "$mux_movie"
+				mux_movie=''
+			fi
+		else
+			ct_log "MP4 audio requested but ffmpeg CLI is not installed; using video-only clip"
+		fi
+	elif [ "$record_audio" = '1' ]; then
+		ct_log "MP4 audio requested for event $event_id but no microphone PCM was captured; using video-only clip"
+	fi
+
+	movie_bytes="$(wc -c < "$source_movie" 2>/dev/null | tr -d '[:space:]')"
+	ct_is_uint "$movie_bytes" || movie_bytes=0
+	if [ "$movie_bytes" -gt "$max_bytes" ]; then
+		ct_log "final video for event $event_id is ${movie_bytes} bytes and exceeds ${video_max_size_mb} MiB limit; dropping video"
+		rm -f "$raw_movie" "$mux_movie"
+	else
+		final_video="$CT_BASE/$video_name"
+		tmp_video="$CT_BASE/.${video_name}.tmp.$$"
+		if cp "$source_movie" "$tmp_video" 2>/dev/null && mv -f "$tmp_video" "$final_video"; then
+			rm -f "$raw_movie" "$mux_movie"
+		else
+			ct_log "failed to copy completed movie from $source_movie"
+			rm -f "$tmp_video" "$raw_movie" "$mux_movie"
+			final_video=''
+		fi
+	fi
+fi
+
+config_get_bool mqtt_enabled main mqtt_enabled 0
+config_get mqtt_host main mqtt_host ''
+config_get mqtt_port main mqtt_port '1883'
+config_get mqtt_user main mqtt_user ''
+config_get mqtt_password main mqtt_password ''
+config_get_bool mqtt_tls main mqtt_tls 0
+config_get mqtt_cafile main mqtt_cafile '/etc/ssl/certs/ca-certificates.crt'
+config_get mqtt_video_topic main mqtt_video_topic 'camera_tracer/video'
+config_get mqtt_qos main mqtt_qos '1'
+config_get hook_script main hook_script ''
+
+ct_is_uint "$mqtt_port" || mqtt_port=1883
+case "$mqtt_qos" in 0|1|2) ;; *) mqtt_qos=1 ;; esac
+
+publish_video() {
+	[ -n "$final_video" ] && [ -f "$final_video" ] || return 1
+	set -- -h "$mqtt_host" -p "$mqtt_port" -q "$mqtt_qos"
+	[ -n "$mqtt_user" ] && set -- "$@" -u "$mqtt_user"
+	[ -n "$mqtt_password" ] && set -- "$@" -P "$mqtt_password"
+	if [ "$mqtt_tls" -eq 1 ]; then
+		[ -r "$mqtt_cafile" ] || {
+			ct_log "MQTT TLS enabled but CA file is not readable: $mqtt_cafile"
+			return 1
+		}
+		set -- "$@" --cafile "$mqtt_cafile"
+	fi
+	/usr/bin/mosquitto_pub "$@" -t "$mqtt_video_topic" -f "$final_video"
+}
+
+if [ "$mqtt_enabled" -eq 1 ] && [ -n "$mqtt_host" ] && [ -n "$mqtt_video_topic" ] && [ -n "$final_video" ]; then
+	if publish_video; then
+		ct_log "published MP4 to MQTT topic $mqtt_video_topic"
+	else
+		ct_log "failed to publish MP4 to MQTT topic $mqtt_video_topic"
+	fi
+fi
+
+if ! ct_call_hook "$hook_script" "$source_type" "$photo" "$final_video" "$trigger_epoch" "$trigger_timestamp"; then
+	[ -n "$hook_script" ] && ct_log "hook script failed: $hook_script"
+fi
+
+rm -f "$map_file"
+rm -rf "$event_dir"
+exit 0

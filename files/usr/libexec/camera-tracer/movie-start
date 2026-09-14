@@ -1,0 +1,37 @@
+#!/bin/sh
+
+. /usr/libexec/camera-tracer/common.sh
+
+raw_movie="${1:-}"
+event_id="${2:-}"
+ct_is_uint "$event_id" || exit 0
+
+generation="$(cat "$CT_BASE/generation" 2>/dev/null)"
+[ -n "$generation" ] || exit 0
+
+# A visual Motion event already has a direct state directory keyed by Motion's
+# event id. In that case there is nothing to bind.
+direct_dir="$(ct_event_dir "$generation" "$event_id" 2>/dev/null || true)"
+[ -n "$direct_dir" ] && [ -d "$direct_dir" ] && exit 0
+
+# Audio-triggered recording starts Motion through webcontrol, so its Motion
+# event id is not known when the Camera Tracer event is accepted. Claim the
+# one pending audio event and map this Motion event id to its state directory.
+lock="$CT_BASE/audio-video-bind.lock"
+mkdir "$lock" 2>/dev/null || exit 0
+trap 'rmdir "$lock" 2>/dev/null || true' EXIT INT TERM
+
+pending="$(ct_audio_pending_read 2>/dev/null || true)"
+pending_generation="$(printf '%s\n' "$pending" | sed -n '1p')"
+pending_dir="$(printf '%s\n' "$pending" | sed -n '2p')"
+
+[ "$pending_generation" = "$generation" ] || exit 0
+[ -n "$pending_dir" ] && [ -d "$pending_dir" ] || exit 0
+
+map_file="$CT_STATE/$generation/map-$event_id"
+tmp_map="$map_file.tmp.$$"
+printf '%s\n' "$pending_dir" > "$tmp_map" || exit 0
+mv -f "$tmp_map" "$map_file" || exit 0
+rm -f "$CT_BASE/audio-video-pending"
+ct_log "bound audio trigger to Motion event $event_id; movie=$raw_movie"
+exit 0

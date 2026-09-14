@@ -1,0 +1,136 @@
+#!/bin/sh
+
+. /usr/libexec/camera-tracer/common.sh
+
+source_type="${1:-video}"
+photo="${2:-}"
+trigger_epoch="${3:-$(date +%s)}"
+trigger_timestamp="${4:-$(date '+%Y-%m-%dT%H:%M:%S%z')}"
+expected_generation="${5:-}"
+event_dir="${6:-}"
+
+[ -f "$photo" ] || exit 1
+
+still_current() {
+	local current
+	[ -n "$expected_generation" ] || return 1
+	current="$(cat "$CT_BASE/generation" 2>/dev/null)"
+	[ "$current" = "$expected_generation" ]
+}
+
+set_decision() {
+	[ -n "$event_dir" ] || return 0
+	ct_state_write "$event_dir" decision "$1"
+}
+
+still_current || exit 0
+
+ct_load_config
+ct_get_trusted_ips
+trusted_count="$(ct_trusted_count)"
+config_get trusted_timeout main trusted_timeout '5'
+ct_is_uint "$trusted_timeout" || trusted_timeout=5
+
+if [ "$trusted_count" -gt 0 ]; then
+	[ "$trusted_timeout" -gt 0 ] && sleep "$trusted_timeout"
+	still_current || exit 0
+	if ct_trusted_wifi_present; then
+		set_decision suppress
+		[ -n "$event_dir" ] && ct_audio_record_stop "$event_dir"
+		ct_log "alarm suppressed after $source_type trigger because a trusted Wi-Fi client is present"
+		# An audio trigger may have forced a Motion event solely for this alarm.
+		# Stop it early when the alarm is suppressed; visual motion events are
+		# left under Motion's normal event lifecycle.
+		if [ "$source_type" = audio ] && [ -n "$event_dir" ]; then
+			ct_motion_action eventend || true
+		fi
+		exit 0
+	fi
+fi
+
+still_current || exit 0
+set_decision allow
+
+config_get_bool mqtt_enabled main mqtt_enabled 0
+config_get mqtt_host main mqtt_host ''
+config_get mqtt_port main mqtt_port '1883'
+config_get mqtt_user main mqtt_user ''
+config_get mqtt_password main mqtt_password ''
+config_get_bool mqtt_tls main mqtt_tls 0
+config_get mqtt_cafile main mqtt_cafile '/etc/ssl/certs/ca-certificates.crt'
+config_get mqtt_image_topic main mqtt_image_topic 'camera_tracer/image'
+config_get mqtt_event_topic main mqtt_event_topic 'camera_tracer/event'
+config_get mqtt_qos main mqtt_qos '1'
+config_get_bool send_photo main send_photo 1
+config_get_bool video_enabled main video_enabled 0
+config_get_bool video_audio_enabled main video_audio_enabled 0
+config_get hook_script main hook_script ''
+
+ct_is_uint "$mqtt_port" || mqtt_port=1883
+case "$mqtt_qos" in 0|1|2) ;; *) mqtt_qos=1 ;; esac
+
+publish_image() {
+	set -- -h "$mqtt_host" -p "$mqtt_port" -q "$mqtt_qos"
+	[ -n "$mqtt_user" ] && set -- "$@" -u "$mqtt_user"
+	[ -n "$mqtt_password" ] && set -- "$@" -P "$mqtt_password"
+	if [ "$mqtt_tls" -eq 1 ]; then
+		[ -r "$mqtt_cafile" ] || {
+			ct_log "MQTT TLS enabled but CA file is not readable: $mqtt_cafile"
+			return 1
+		}
+		set -- "$@" --cafile "$mqtt_cafile"
+	fi
+	/usr/bin/mosquitto_pub "$@" -t "$mqtt_image_topic" -f "$photo"
+}
+
+publish_event() {
+	local photo_name payload video_pending audio_requested
+	photo_name="${photo##*/}"
+	video_pending=false
+	audio_requested=false
+	[ "$video_enabled" -eq 1 ] && [ -n "$event_dir" ] && video_pending=true
+	[ "$video_pending" = true ] && [ "$video_audio_enabled" -eq 1 ] && audio_requested=true
+	payload="{\"event\":\"trigger\",\"source\":\"$(ct_json_escape "$source_type")\",\"timestamp\":\"$(ct_json_escape "$trigger_timestamp")\",\"photo\":\"$(ct_json_escape "$photo_name")\",\"video_pending\":$video_pending,\"audio_requested\":$audio_requested}"
+
+	set -- -h "$mqtt_host" -p "$mqtt_port" -q "$mqtt_qos"
+	[ -n "$mqtt_user" ] && set -- "$@" -u "$mqtt_user"
+	[ -n "$mqtt_password" ] && set -- "$@" -P "$mqtt_password"
+	if [ "$mqtt_tls" -eq 1 ]; then
+		[ -r "$mqtt_cafile" ] || {
+			ct_log "MQTT TLS enabled but CA file is not readable: $mqtt_cafile"
+			return 1
+		}
+		set -- "$@" --cafile "$mqtt_cafile"
+	fi
+	/usr/bin/mosquitto_pub "$@" -t "$mqtt_event_topic" -m "$payload"
+}
+
+if [ "$mqtt_enabled" -eq 1 ] && [ -n "$mqtt_host" ]; then
+	if [ "$send_photo" -eq 1 ] && [ -n "$mqtt_image_topic" ]; then
+		if publish_image; then
+			ct_log "published JPEG to MQTT topic $mqtt_image_topic"
+		else
+			ct_log "failed to publish JPEG to MQTT topic $mqtt_image_topic"
+		fi
+	fi
+
+	if [ -n "$mqtt_event_topic" ]; then
+		if publish_event; then
+			ct_log "published event to MQTT topic $mqtt_event_topic"
+		else
+			ct_log "failed to publish event to MQTT topic $mqtt_event_topic"
+		fi
+	fi
+fi
+
+# For either trigger source with video enabled, defer the hook until
+# on_movie_end so one invocation receives both the immediate trigger photo and
+# the completed MP4. If video could not be started, event_dir is empty and the
+# hook falls back to photo-only delivery.
+if [ "$video_enabled" -ne 1 ] || [ -z "$event_dir" ]; then
+	if ! ct_call_hook "$hook_script" "$source_type" "$photo" '' "$trigger_epoch" "$trigger_timestamp"; then
+		[ -n "$hook_script" ] && ct_log "hook script failed: $hook_script"
+	fi
+fi
+
+exit 0
