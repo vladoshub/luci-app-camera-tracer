@@ -1,0 +1,61 @@
+#!/bin/sh
+
+. /usr/libexec/camera-tracer/common.sh
+
+expected_generation="${1:-}"
+expected_session="${2:-}"
+event_dir="${3:-}"
+duration="${4:-15}"
+
+ct_is_uint "$duration" || duration=15
+[ "$duration" -ge 1 ] 2>/dev/null || duration=1
+[ "$duration" -le 120 ] 2>/dev/null || duration=120
+
+sleep "$duration"
+
+current_generation="$(cat "$CT_BASE/generation" 2>/dev/null)"
+[ -n "$expected_generation" ] && [ "$current_generation" = "$expected_generation" ] || exit 0
+
+# End only the Motion event actually bound to this synthetic trigger. The old
+# implementation called eventend unconditionally after the timer, which could
+# terminate an unrelated event if the synthetic event had already closed.
+if ct_motion_session_is_current "$expected_session" && [ -d "$event_dir" ]; then
+	bound_id="$(ct_state_read "$event_dir" motion_event_id 2>/dev/null || true)"
+	active="$(ct_motion_event_active_read 2>/dev/null || true)"
+	active_session="$(printf '%s\n' "$active" | sed -n '1p')"
+	active_id="$(printf '%s\n' "$active" | sed -n '2p')"
+	if ct_is_uint "$bound_id" && [ "$active_session" = "$expected_session" ] && [ "$active_id" = "$bound_id" ]; then
+		ct_motion_action eventend || ct_log "failed to end forced synthetic video event $bound_id"
+	fi
+fi
+ct_audio_record_stop "$event_dir"
+
+# Normally on_movie_start has already consumed the pending marker and
+# on_movie_end will finalize the event. If no movie ever started, release the
+# marker and deliver the accepted event to the local hook with its photo instead
+# of waiting forever for an MP4 that does not exist.
+sleep 3
+pending="$(ct_synthetic_pending_read 2>/dev/null || true)"
+pending_generation="$(printf '%s\n' "$pending" | sed -n '1p')"
+pending_session="$(printf '%s\n' "$pending" | sed -n '2p')"
+pending_dir="$(printf '%s\n' "$pending" | sed -n '3p')"
+[ "$pending_generation" = "$expected_generation" ] || exit 0
+[ "$pending_session" = "$expected_session" ] || exit 0
+[ "$pending_dir" = "$event_dir" ] || exit 0
+
+rm -f "$CT_BASE/synthetic-video-pending"
+
+ct_load_config
+config_get hook_script main hook_script ''
+photo="$(ct_state_read "$event_dir" photo 2>/dev/null || true)"
+source_type="$(ct_state_read "$event_dir" source 2>/dev/null || true)"
+trigger_epoch="$(ct_state_read "$event_dir" epoch 2>/dev/null || true)"
+trigger_timestamp="$(ct_state_read "$event_dir" timestamp 2>/dev/null || true)"
+[ -n "$source_type" ] || source_type='synthetic'
+[ -n "$trigger_epoch" ] || trigger_epoch="$(date +%s)"
+[ -n "$trigger_timestamp" ] || trigger_timestamp="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+ct_log "$source_type event produced no MP4 in Motion session $expected_session; finalizing hook with photo only"
+ct_call_hook "$hook_script" "$source_type" "$photo" '' "$trigger_epoch" "$trigger_timestamp" || true
+
+rm -rf "$event_dir"
+exit 0

@@ -1,8 +1,8 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-camera-tracer
-PKG_VERSION:=0.3.0
-PKG_RELEASE:=1
+PKG_VERSION:=0.6.8
+PKG_RELEASE:=2
 PKG_LICENSE:=GPL-2.0-or-later
 PKG_LICENSE_FILES:=LICENSE
 PKG_MAINTAINER:=Camera Tracer contributors
@@ -14,15 +14,16 @@ define Package/luci-app-camera-tracer
   SECTION:=luci
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
-  TITLE:=LuCI interface for UVC motion/audio tracing
+  TITLE:=LuCI interface for UVC motion/audio/timer/MQTT tracing
   DEPENDS:=+luci-base +motion-ffmpeg +v4l-utils +iwinfo +mosquitto-client-ssl +ca-bundle +uclient-fetch +kmod-video-uvc
 endef
 
 define Package/luci-app-camera-tracer/description
- Camera Tracer monitors a UVC camera with Motion, optionally records bounded
- MP4 clips, optionally monitors an ALSA microphone and can mux microphone audio
- into completed clips, checks trusted Wi-Fi clients after a configurable delay,
- publishes JPEG/video/event messages over MQTT and can invoke a local alarm hook.
+ Camera Tracer monitors a UVC camera with Motion, optional ALSA audio and a
+ periodic timer or a dedicated MQTT trigger topic, records bounded MP4 clips,
+ can mux microphone audio into completed clips, can pause camera capture while
+ trusted Wi-Fi clients are present, publishes JPEG/video/event messages over MQTT,
+ accepts MQTT runtime trigger controls, and can invoke a local alarm hook.
  ALSA/ffmpeg CLI runtime packages for audio features remain optional.
 endef
 
@@ -44,6 +45,8 @@ define Package/luci-app-camera-tracer/install
 	$(INSTALL_BIN) ./files/usr/libexec/camera-tracer/* $(1)/usr/libexec/camera-tracer/
 
 	$(INSTALL_DIR) $(1)/usr/share/camera-tracer/examples
+	$(INSTALL_BIN) ./examples/example-hook.sh $(1)/usr/share/camera-tracer/examples/example-hook.sh
+	$(INSTALL_DATA) ./examples/example-hook.conf.example $(1)/usr/share/camera-tracer/examples/example-hook.conf.example
 
 	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d
 	$(INSTALL_DATA) ./files/usr/share/luci/menu.d/luci-app-camera-tracer.json \

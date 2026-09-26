@@ -1,0 +1,216 @@
+#!/bin/sh
+
+. /usr/libexec/camera-tracer/common.sh
+
+ct_load_config
+config_get_bool gate_enabled main trusted_camera_pause_enabled 0
+config_get check_seconds main trusted_check_interval_seconds ''
+config_get legacy_check_minutes main trusted_check_interval_minutes ''
+
+# When the gate is disabled, preserve the original camera/Motion path exactly.
+if [ "$gate_enabled" -ne 1 ]; then
+	ct_camera_pause_clear
+	exec /usr/libexec/camera-tracer/run-motion
+fi
+
+# 0.6.2 stores the polling period in seconds. Preserve old 0.6.0/0.6.1
+# configurations by interpreting the legacy minutes value when the new key is
+# absent. A later LuCI save writes the seconds key.
+if ! ct_is_uint "$check_seconds"; then
+	if ct_is_uint "$legacy_check_minutes"; then
+		check_seconds=$((legacy_check_minutes * 60))
+	else
+		check_seconds=10
+	fi
+fi
+[ "$check_seconds" -ge 5 ] 2>/dev/null || check_seconds=5
+[ "$check_seconds" -le 3600 ] 2>/dev/null || check_seconds=3600
+
+ct_get_trusted_ips
+trusted_count="$(ct_trusted_count)"
+if [ "$trusted_count" -eq 0 ]; then
+	ct_log "trusted camera pause enabled but no trusted IPs are configured; camera capture remains enabled"
+	ct_camera_pause_clear
+	exec /usr/libexec/camera-tracer/run-motion
+fi
+
+motion_pid=''
+presence='unknown'
+next_check=0
+pause_deadline=0
+pause_wait_logged=0
+
+compute_drain_timeout() {
+	local max_time timeout
+	ct_load_config
+	config_get max_time main video_max_time '15'
+	ct_is_uint "$max_time" || max_time=15
+	[ "$max_time" -ge 1 ] 2>/dev/null || max_time=1
+	[ "$max_time" -le 120 ] 2>/dev/null || max_time=120
+	# A synthetic event may need a few seconds after movie_max_time to bind/close.
+	# This is deliberately bounded so stale event state can never keep the camera
+	# open forever after a trusted device is detected.
+	timeout=$((max_time + 15))
+	[ "$timeout" -lt 20 ] && timeout=20
+	[ "$timeout" -gt 180 ] && timeout=180
+	printf '%s\n' "$timeout"
+}
+
+stop_motion() {
+	local i forced=0
+	[ -n "$motion_pid" ] || return 0
+	if kill -0 "$motion_pid" 2>/dev/null; then
+		kill "$motion_pid" 2>/dev/null || true
+		i=0
+		while kill -0 "$motion_pid" 2>/dev/null && [ "$i" -lt 10 ]; do
+			sleep 1
+			i=$((i + 1))
+		done
+		if kill -0 "$motion_pid" 2>/dev/null; then
+			forced=1
+			ct_log "Motion did not stop after 10s; forcing termination and clearing media capture state"
+			ct_abandon_active_media
+			kill -9 "$motion_pid" 2>/dev/null || true
+		fi
+	fi
+	if [ "$forced" -eq 1 ]; then
+		# Never block the gate forever waiting on a task stuck in an uninterruptible
+		# driver wait. Give SIGKILL a short chance to complete, then detach from the
+		# PID and keep the supervisor responsive.
+		i=0
+		while kill -0 "$motion_pid" 2>/dev/null && [ "$i" -lt 2 ]; do
+			sleep 1
+			i=$((i + 1))
+		done
+		if kill -0 "$motion_pid" 2>/dev/null; then
+			ct_log "Motion process $motion_pid is still present after SIGKILL; not waiting on it to avoid stalling the trusted-presence gate"
+		else
+			wait "$motion_pid" 2>/dev/null || true
+		fi
+	else
+		wait "$motion_pid" 2>/dev/null || true
+	fi
+	motion_pid=''
+	[ "$forced" -eq 0 ] || rm -f "$CT_RAW"/clip-*.mp4 "$CT_RAW"/.mux-*.mp4
+}
+
+start_motion() {
+	[ -n "$motion_pid" ] && kill -0 "$motion_pid" 2>/dev/null && return 0
+	ct_camera_pause_clear
+	/usr/libexec/camera-tracer/run-motion &
+	motion_pid=$!
+}
+
+request_pause() {
+	local now drain_timeout
+	now="$(date +%s)"
+	ct_camera_pause_set || ct_log "failed to publish trusted camera pause state"
+	if [ "$presence" != '1' ]; then
+		drain_timeout="$(compute_drain_timeout)"
+		pause_deadline=$((now + drain_timeout))
+		pause_wait_logged=0
+		ct_log "trusted presence gate: trusted Wi-Fi client detected; blocking new triggers immediately"
+	fi
+	presence=1
+}
+
+reconcile_pause() {
+	local now
+	[ "$presence" = '1' ] || return 0
+	[ -n "$motion_pid" ] || return 0
+
+	if ct_media_event_active; then
+		now="$(date +%s)"
+		if [ "$pause_wait_logged" -eq 2 ]; then
+			# An event passed the pre-gate immediately before camera-paused was
+			# published and became visible during the short race-closing grace.
+			pause_wait_logged=1
+			pause_deadline=$((now + $(compute_drain_timeout)))
+			ct_log "trusted presence gate: accepted media event appeared during pause grace; waiting for it to close"
+		elif [ "$pause_wait_logged" -eq 0 ]; then
+			ct_log "trusted presence gate: accepted media event is still active; waiting for current movie to close before stopping camera"
+			pause_wait_logged=1
+		fi
+		if [ "$pause_deadline" -gt 0 ] && [ "$now" -ge "$pause_deadline" ]; then
+			ct_log "trusted presence gate: media drain deadline exceeded; abandoning unfinished media before camera stop"
+			ct_abandon_active_media
+			stop_motion
+			ct_log "trusted presence gate: camera capture paused after forced media cleanup"
+		fi
+		return 0
+	fi
+
+	# Small grace closes the race where a visual trigger passed the pre-gate just
+	# before camera-paused was published but has not created its event state yet.
+	if [ "$pause_wait_logged" -eq 0 ]; then
+		pause_wait_logged=2
+		pause_deadline=$(( $(date +%s) + 2 ))
+		return 0
+	fi
+	if [ "$pause_wait_logged" -eq 2 ]; then
+		now="$(date +%s)"
+		[ "$now" -lt "$pause_deadline" ] && return 0
+		# Check once more at the grace boundary to close the tiny race between
+		# the first active-state probe above and stopping Motion.
+		if ct_media_event_active; then
+			pause_wait_logged=1
+			pause_deadline=$((now + $(compute_drain_timeout)))
+			ct_log "trusted presence gate: accepted media event appeared at pause boundary; waiting for it to close"
+			return 0
+		fi
+	fi
+
+	stop_motion
+	ct_log "trusted presence gate: camera capture paused because a trusted Wi-Fi client is present"
+}
+
+set_active() {
+	ct_camera_pause_clear
+	if [ "$presence" != '0' ]; then
+		ct_log "trusted presence gate: no trusted Wi-Fi client present; camera capture enabled"
+	fi
+	presence=0
+	pause_deadline=0
+	pause_wait_logged=0
+}
+
+cleanup() {
+	stop_motion
+	ct_camera_pause_clear
+}
+trap 'cleanup; exit 0' INT TERM
+
+ct_log "starting trusted presence camera gate: trusted_ips=$trusted_count check_interval=${check_seconds}s"
+
+while :; do
+	now="$(date +%s)"
+
+	# Presence is checked immediately at service start and then at the configured
+	# interval. This supervisor is the only code path that queries trusted-device
+	# presence; accepted-event delivery never performs a second presence check.
+	if [ "$now" -ge "$next_check" ]; then
+		ct_load_config
+		ct_get_trusted_ips
+		if ct_trusted_wifi_present; then
+			request_pause
+		else
+			set_active
+		fi
+		next_check=$((now + check_seconds))
+	fi
+
+	if [ "$presence" = '1' ]; then
+		reconcile_pause
+	else
+		if [ -n "$motion_pid" ] && ! kill -0 "$motion_pid" 2>/dev/null; then
+			wait "$motion_pid" 2>/dev/null || true
+			motion_pid=''
+			ct_camera_pause_clear
+			ct_log "Motion exited unexpectedly while trusted camera gate was active; leaving restart/backoff to procd"
+			exit 1
+		fi
+		[ -n "$motion_pid" ] || start_motion
+	fi
+
+	sleep 1
+done

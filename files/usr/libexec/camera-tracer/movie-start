@@ -2,36 +2,44 @@
 
 . /usr/libexec/camera-tracer/common.sh
 
-raw_movie="${1:-}"
-event_id="${2:-}"
+motion_session="${1:-}"
+raw_movie="${2:-}"
+event_id="${3:-}"
 ct_is_uint "$event_id" || exit 0
+ct_motion_session_is_current "$motion_session" || exit 0
 
 generation="$(cat "$CT_BASE/generation" 2>/dev/null)"
 [ -n "$generation" ] || exit 0
 
-# A visual Motion event already has a direct state directory keyed by Motion's
-# event id. In that case there is nothing to bind.
-direct_dir="$(ct_event_dir "$generation" "$event_id" 2>/dev/null || true)"
+# A visual Motion event already has a session-scoped direct state directory.
+# In that case there is nothing to bind.
+direct_dir="$(ct_event_dir "$generation" "${motion_session}-event-${event_id}" 2>/dev/null || true)"
 [ -n "$direct_dir" ] && [ -d "$direct_dir" ] && exit 0
 
-# Audio-triggered recording starts Motion through webcontrol, so its Motion
-# event id is not known when the Camera Tracer event is accepted. Claim the
-# one pending audio event and map this Motion event id to its state directory.
-lock="$CT_BASE/audio-video-bind.lock"
+# Audio/timer/MQTT recording is started through Motion webcontrol, so its
+# generated Motion event id is not known when Camera Tracer accepts the trigger.
+# Claim the single pending event only when it belongs to this exact Motion
+# session; event ids may restart at 1 after trusted-device camera resume.
+lock="$CT_BASE/synthetic-video-bind.lock"
 mkdir "$lock" 2>/dev/null || exit 0
 trap 'rmdir "$lock" 2>/dev/null || true' EXIT INT TERM
 
-pending="$(ct_audio_pending_read 2>/dev/null || true)"
+pending="$(ct_synthetic_pending_read 2>/dev/null || true)"
 pending_generation="$(printf '%s\n' "$pending" | sed -n '1p')"
-pending_dir="$(printf '%s\n' "$pending" | sed -n '2p')"
+pending_session="$(printf '%s\n' "$pending" | sed -n '2p')"
+pending_dir="$(printf '%s\n' "$pending" | sed -n '3p')"
 
 [ "$pending_generation" = "$generation" ] || exit 0
+[ "$pending_session" = "$motion_session" ] || exit 0
 [ -n "$pending_dir" ] && [ -d "$pending_dir" ] || exit 0
 
-map_file="$CT_STATE/$generation/map-$event_id"
+map_file="$CT_STATE/$generation/map-${motion_session}-${event_id}"
 tmp_map="$map_file.tmp.$$"
 printf '%s\n' "$pending_dir" > "$tmp_map" || exit 0
 mv -f "$tmp_map" "$map_file" || exit 0
-rm -f "$CT_BASE/audio-video-pending"
-ct_log "bound audio trigger to Motion event $event_id; movie=$raw_movie"
+ct_state_write "$pending_dir" motion_event_id "$event_id" || exit 0
+rm -f "$CT_BASE/synthetic-video-pending"
+source_type="$(ct_state_read "$pending_dir" source 2>/dev/null || true)"
+[ -n "$source_type" ] || source_type='synthetic'
+ct_log "bound $source_type trigger to Motion session $motion_session event $event_id; movie=$raw_movie"
 exit 0

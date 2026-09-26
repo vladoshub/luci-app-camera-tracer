@@ -1,0 +1,9 @@
+#!/bin/sh
+
+. /usr/libexec/camera-tracer/common.sh
+
+motion_session="${1:-}"
+event_id="${2:-}"
+ct_is_uint "$event_id" || exit 0
+ct_motion_event_active_clear "$motion_session" "$event_id"
+exit 0

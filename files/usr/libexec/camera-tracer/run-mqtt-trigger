@@ -1,0 +1,40 @@
+#!/bin/sh
+
+. /usr/libexec/camera-tracer/common.sh
+
+ct_load_config
+config_get mqtt_host main mqtt_host ''
+config_get mqtt_port main mqtt_port '1883'
+config_get mqtt_user main mqtt_user ''
+config_get mqtt_password main mqtt_password ''
+config_get_bool mqtt_tls main mqtt_tls 0
+config_get mqtt_cafile main mqtt_cafile '/etc/ssl/certs/ca-certificates.crt'
+config_get mqtt_trigger_topic main mqtt_trigger_topic 'camera_tracer/trigger'
+config_get mqtt_qos main mqtt_qos '1'
+
+[ -n "$mqtt_host" ] || { ct_log "MQTT message trigger broker host is empty"; exit 1; }
+[ -n "$mqtt_trigger_topic" ] || { ct_log "MQTT message trigger topic is empty"; exit 1; }
+ct_is_uint "$mqtt_port" || mqtt_port=1883
+case "$mqtt_qos" in 0|1|2) ;; *) mqtt_qos=1 ;; esac
+
+set -- -h "$mqtt_host" -p "$mqtt_port" -q "$mqtt_qos" -t "$mqtt_trigger_topic"
+[ -n "$mqtt_user" ] && set -- "$@" -u "$mqtt_user"
+[ -n "$mqtt_password" ] && set -- "$@" -P "$mqtt_password"
+if [ "$mqtt_tls" -eq 1 ]; then
+	[ -r "$mqtt_cafile" ] || {
+		ct_log "MQTT message trigger TLS enabled but CA file is not readable: $mqtt_cafile"
+		exit 1
+	}
+	set -- "$@" --cafile "$mqtt_cafile"
+fi
+
+ct_log "starting MQTT message trigger subscriber: topic=$mqtt_trigger_topic"
+
+# Every received MQTT message is one trigger request. Payload content is ignored.
+# The shared event reservation/holdoff is authoritative, so messages arriving
+# while another accepted alarm is locked are simply discarded, never queued.
+/usr/bin/mosquitto_sub "$@" | while IFS= read -r _payload; do
+	if ct_trigger_enabled mqtt; then
+		/usr/libexec/camera-tracer/event mqtt >/dev/null 2>&1 &
+	fi
+done

@@ -17,4 +17,4 @@ jobs:
           sudo apt-get install -y busybox make python3
 
       - name: Run static checks
-        run: ./tests/static-check.sh
+        run: bash ./tests/static-check.sh

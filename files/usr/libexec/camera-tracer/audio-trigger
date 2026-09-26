@@ -1,0 +1,50 @@
+#!/bin/sh
+
+# The audio detector may present a trigger opportunity repeatedly while a loud
+# sound remains above threshold and quiet re-arm is disabled. Keep those
+# repeated opportunities on a tiny tmpfs fast path while the shared Camera
+# Tracer holdoff is active; event remains the authoritative cross-source gate.
+BASE='/tmp/camera_tracer'
+
+# Runtime audio control is mirrored into tmpfs when MQTT trigger control is in
+# use. If the state file exists, avoid entering the heavier event script while
+# audio triggering is disabled. event re-checks the source state as well.
+if [ -r "$BASE/control/audio" ]; then
+	read -r audio_enabled < "$BASE/control/audio" || audio_enabled=0
+	[ "$audio_enabled" = '1' ] || exit 0
+fi
+
+# Trusted-device presence is handled only by the camera supervisor. Do not
+# dispatch an audio alarm while camera capture is intentionally paused.
+[ -e "$BASE/camera-paused" ] && exit 0
+
+now="$(date +%s)"
+next=0
+if [ -r "$BASE/next_allowed" ]; then
+	read -r next < "$BASE/next_allowed" || next=0
+fi
+case "$next" in
+	''|*[!0-9]*) next=0 ;;
+esac
+[ "$now" -lt "$next" ] && exit 0
+
+# Coalesce simultaneous detector callbacks around the instant holdoff expires.
+# event still performs the atomic global reservation and wins any race with
+# motion, timer or MQTT triggers.
+lock="$BASE/audio-trigger-dispatch.lock"
+mkdir -p "$BASE"
+mkdir "$lock" 2>/dev/null || exit 0
+trap 'rmdir "$lock" 2>/dev/null || true' EXIT INT TERM
+
+now="$(date +%s)"
+next=0
+if [ -r "$BASE/next_allowed" ]; then
+	read -r next < "$BASE/next_allowed" || next=0
+fi
+case "$next" in
+	''|*[!0-9]*) next=0 ;;
+esac
+[ "$now" -lt "$next" ] && exit 0
+
+/usr/libexec/camera-tracer/event audio
+exit $?

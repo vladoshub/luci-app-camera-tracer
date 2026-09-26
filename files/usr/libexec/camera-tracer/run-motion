@@ -8,6 +8,8 @@ config_get video_device main video_device '/dev/video0'
 config_get resolution main resolution '640x480'
 config_get fps main fps '5'
 config_get threshold main video_threshold '1500'
+config_get minimum_motion_frames main minimum_motion_frames '2'
+config_get_bool motion_enabled main motion_enabled 1
 config_get_bool audio_enabled main audio_enabled 0
 config_get_bool video_enabled main video_enabled 0
 config_get video_max_time main video_max_time '15'
@@ -30,6 +32,9 @@ ct_is_uint "$fps" || fps=5
 [ "$fps" -ge 1 ] 2>/dev/null || fps=5
 [ "$fps" -le 60 ] 2>/dev/null || fps=60
 ct_is_uint "$threshold" || threshold=1500
+ct_is_uint "$minimum_motion_frames" || minimum_motion_frames=2
+[ "$minimum_motion_frames" -ge 1 ] 2>/dev/null || minimum_motion_frames=1
+[ "$minimum_motion_frames" -le 30 ] 2>/dev/null || minimum_motion_frames=30
 
 ct_is_uint "$video_max_time" || video_max_time=15
 [ "$video_max_time" -ge 1 ] 2>/dev/null || video_max_time=1
@@ -52,14 +57,27 @@ ct_is_uint "$video_quality" || video_quality=60
 [ "$video_quality" -le 100 ] 2>/dev/null || video_quality=100
 
 mkdir -p "$CT_RAW" "$CT_STATE"
-rm -f "$CT_RAW"/trigger-*.jpg "$CT_RAW"/audio-snapshot.jpg "$CT_RAW"/lastsnap.jpg "$CT_RAW"/clip-*.mp4
+rm -f "$CT_RAW"/trigger-*.jpg "$CT_RAW"/synthetic-snapshot.jpg "$CT_RAW"/audio-snapshot.jpg "$CT_RAW"/lastsnap.jpg "$CT_RAW"/clip-*.mp4
 
-webcontrol_port=0
-webcontrol_parms=0
-if [ "$audio_enabled" -eq 1 ]; then
-	webcontrol_port="$CT_WEBCONTROL_PORT"
-	webcontrol_parms=1
-fi
+# Motion event ids restart from 1 every time Motion is launched. Keep a separate
+# per-process session id so callbacks from a resumed camera can never collide
+# with state left by an earlier Motion instance in the same Camera Tracer run.
+generation="$(cat "$CT_BASE/generation" 2>/dev/null)"
+[ -n "$generation" ] || { ct_log "missing Camera Tracer generation"; exit 1; }
+motion_session="$(date +%s)-$$"
+tmp_session="$CT_BASE/.motion-session.tmp.$$"
+printf '%s\n' "$motion_session" > "$tmp_session" || exit 1
+mv -f "$tmp_session" "$CT_BASE/motion-session" || exit 1
+rm -f "$CT_BASE/motion-event-active"
+rm -rf "$CT_BASE/synthetic-video-bind.lock"
+
+# Synthetic triggers (audio/timer/MQTT message) all use Motion's localhost
+# action endpoints. Keep webcontrol available unconditionally while Camera
+# Tracer is running. It remains bound to localhost, so this does not expose
+# Motion control to LAN/WAN clients. This also guarantees that a trigger which
+# is enabled later through MQTT runtime control works without restarting Motion.
+webcontrol_port="$CT_WEBCONTROL_PORT"
+webcontrol_parms=1
 
 movie_output=off
 if [ "$video_enabled" -eq 1 ]; then
@@ -77,29 +95,31 @@ width $width
 height $height
 framerate $fps
 threshold $threshold
-minimum_motion_frames 2
+minimum_motion_frames $minimum_motion_frames
 event_gap 1
 pre_capture $video_pre_capture_frames
 post_capture $post_capture_frames
-picture_output first
+picture_output off
 picture_type jpeg
 picture_quality 85
 picture_filename trigger-%v-%Y%m%d-%H%M%S-%q
 snapshot_interval 0
-snapshot_filename audio-snapshot
+snapshot_filename synthetic-snapshot
 movie_output $movie_output
 movie_codec mp4:mpeg4
 movie_quality $video_quality
 movie_max_time $video_max_time
 movie_filename clip-%v-%Y%m%d-%H%M%S
-on_picture_save /usr/libexec/camera-tracer/event video %f %v
-on_movie_start /usr/libexec/camera-tracer/movie-start %f %v
-on_movie_end /usr/libexec/camera-tracer/movie-end %f %v
+on_event_start /usr/libexec/camera-tracer/motion-event-start $motion_session %v
+on_event_end /usr/libexec/camera-tracer/motion-event-end $motion_session %v
+on_motion_detected /usr/libexec/camera-tracer/motion-trigger $motion_session %v
+on_movie_start /usr/libexec/camera-tracer/movie-start $motion_session %f %v
+on_movie_end /usr/libexec/camera-tracer/movie-end $motion_session %f %v
 webcontrol_port $webcontrol_port
 webcontrol_localhost on
 webcontrol_interface 1
 webcontrol_parms $webcontrol_parms
 EOF_CONF
 
-ct_log "starting Motion: device=$video_device resolution=${width}x${height} fps=$fps threshold=$threshold video=$movie_output max=${video_max_time}s pre=${video_pre_capture_frames}f post=${video_post_capture_seconds}s"
+ct_log "starting Motion: session=$motion_session device=$video_device resolution=${width}x${height} fps=$fps motion_trigger=$motion_enabled threshold=$threshold minimum_motion_frames=$minimum_motion_frames video=$movie_output max=${video_max_time}s pre=${video_pre_capture_frames}f post=${video_post_capture_seconds}s"
 exec /usr/bin/motion -n -c "$CT_BASE/motion.conf"

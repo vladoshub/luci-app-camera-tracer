@@ -1,0 +1,3 @@
+# Example-only endpoint. The .invalid TLD is reserved and intentionally does not resolve.
+ENDPOINT='https://camera-tracer.invalid/v1/events'
+API_TOKEN='replace_me'

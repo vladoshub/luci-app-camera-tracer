@@ -1,0 +1,38 @@
+#!/bin/sh
+
+. /usr/libexec/camera-tracer/common.sh
+
+ct_load_config
+config_get interval main timer_interval '60'
+ct_is_uint "$interval" || interval=60
+[ "$interval" -ge 1 ] 2>/dev/null || interval=1
+[ "$interval" -le 86400 ] 2>/dev/null || interval=86400
+
+ct_log "starting timer trigger worker: interval=${interval}s"
+
+was_enabled=0
+next_fire=0
+while :; do
+	sleep 1
+	now="$(date +%s)"
+	if ct_trigger_enabled timer; then
+		# Enabling the timer (from LuCI at service start or later over MQTT)
+		# starts a fresh interval rather than causing an immediate alarm.
+		if [ "$was_enabled" -ne 1 ]; then
+			was_enabled=1
+			next_fire=$((now + interval))
+			continue
+		fi
+
+		if [ "$now" -ge "$next_fire" ]; then
+			next_fire=$((now + interval))
+			# Timer ticks are never queued. The event reservation/holdoff is
+			# authoritative: if a previous accepted trigger is still locked,
+			# event exits immediately and this tick is simply discarded.
+			/usr/libexec/camera-tracer/event timer >/dev/null 2>&1 &
+		fi
+	else
+		was_enabled=0
+		next_fire=0
+	fi
+done

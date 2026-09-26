@@ -2,10 +2,14 @@
 
 . /usr/libexec/camera-tracer/common.sh
 
-raw_movie="${1:-}"
-event_id="${2:-}"
+motion_session="${1:-}"
+raw_movie="${2:-}"
+event_id="${3:-}"
 
 [ -f "$raw_movie" ] || exit 0
+case "$motion_session" in
+	''|*[!A-Za-z0-9._-]*) rm -f "$raw_movie"; exit 0 ;;
+esac
 ct_is_uint "$event_id" || {
 	ct_log "movie closed with invalid event id; deleting raw movie: $raw_movie"
 	rm -f "$raw_movie"
@@ -25,18 +29,22 @@ generation="$(cat "$CT_BASE/generation" 2>/dev/null)"
 	exit 0
 }
 
-event_dir="$(ct_event_dir "$generation" "$event_id" 2>/dev/null)" || event_dir=''
-map_file="$CT_STATE/$generation/map-$event_id"
+event_dir="$(ct_event_dir "$generation" "${motion_session}-event-${event_id}" 2>/dev/null)" || event_dir=''
+map_file="$CT_STATE/$generation/map-${motion_session}-${event_id}"
 
 if [ -z "$event_dir" ] || [ ! -d "$event_dir" ]; then
-	# Audio-triggered recording is started through Motion webcontrol. Its Motion
+	# Audio/timer recording is started through Motion webcontrol. Its Motion
 	# event id is learned asynchronously by on_movie_start and mapped back to
 	# the Camera Tracer event state here.
 	event_dir=''
 	if [ -r "$map_file" ]; then
 		mapped_dir="$(cat "$map_file" 2>/dev/null)"
 		case "$mapped_dir" in
-			"$CT_STATE/$generation/"*) [ -d "$mapped_dir" ] && event_dir="$mapped_dir" ;;
+			"$CT_STATE/$generation/"*)
+				if [ -d "$mapped_dir" ] && [ "$(ct_state_read "$mapped_dir" motion_session 2>/dev/null || true)" = "$motion_session" ]; then
+					event_dir="$mapped_dir"
+				fi
+				;;
 		esac
 	fi
 fi
@@ -59,32 +67,6 @@ fi
 # The sink checks the marker between bounded chunks, so no second ALSA open is
 # needed and any tiny tail beyond movie close is naturally discarded by muxing.
 ct_audio_record_stop "$event_dir"
-
-config_get trusted_timeout main trusted_timeout '5'
-ct_is_uint "$trusted_timeout" || trusted_timeout=5
-wait_left=$((trusted_timeout + 5))
-decision="$(ct_state_read "$event_dir" decision 2>/dev/null || true)"
-while [ "$decision" = pending ] && [ "$wait_left" -gt 0 ]; do
-	sleep 1
-	wait_left=$((wait_left - 1))
-	decision="$(ct_state_read "$event_dir" decision 2>/dev/null || true)"
-done
-
-case "$decision" in
-	allow) ;;
-	suppress)
-		ct_log "discarding video for suppressed event $event_id"
-		rm -f "$raw_movie" "$map_file"
-		rm -rf "$event_dir"
-		exit 0
-		;;
-	*)
-		ct_log "discarding video for event $event_id because trusted-device decision was not completed"
-		rm -f "$raw_movie" "$map_file"
-		rm -rf "$event_dir"
-		exit 0
-		;;
-esac
 
 photo="$(ct_state_read "$event_dir" photo 2>/dev/null || true)"
 source_type="$(ct_state_read "$event_dir" source 2>/dev/null || true)"

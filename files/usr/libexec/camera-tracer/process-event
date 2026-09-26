@@ -18,38 +18,10 @@ still_current() {
 	[ "$current" = "$expected_generation" ]
 }
 
-set_decision() {
-	[ -n "$event_dir" ] || return 0
-	ct_state_write "$event_dir" decision "$1"
-}
-
 still_current || exit 0
 
 ct_load_config
-ct_get_trusted_ips
-trusted_count="$(ct_trusted_count)"
-config_get trusted_timeout main trusted_timeout '5'
-ct_is_uint "$trusted_timeout" || trusted_timeout=5
-
-if [ "$trusted_count" -gt 0 ]; then
-	[ "$trusted_timeout" -gt 0 ] && sleep "$trusted_timeout"
-	still_current || exit 0
-	if ct_trusted_wifi_present; then
-		set_decision suppress
-		[ -n "$event_dir" ] && ct_audio_record_stop "$event_dir"
-		ct_log "alarm suppressed after $source_type trigger because a trusted Wi-Fi client is present"
-		# An audio trigger may have forced a Motion event solely for this alarm.
-		# Stop it early when the alarm is suppressed; visual motion events are
-		# left under Motion's normal event lifecycle.
-		if [ "$source_type" = audio ] && [ -n "$event_dir" ]; then
-			ct_motion_action eventend || true
-		fi
-		exit 0
-	fi
-fi
-
 still_current || exit 0
-set_decision allow
 
 config_get_bool mqtt_enabled main mqtt_enabled 0
 config_get mqtt_host main mqtt_host ''
@@ -123,7 +95,7 @@ if [ "$mqtt_enabled" -eq 1 ] && [ -n "$mqtt_host" ]; then
 	fi
 fi
 
-# For either trigger source with video enabled, defer the hook until
+# For any trigger source with video enabled, defer the hook until
 # on_movie_end so one invocation receives both the immediate trigger photo and
 # the completed MP4. If video could not be started, event_dir is empty and the
 # hook falls back to photo-only delivery.

@@ -4,24 +4,42 @@ USE_PROCD=1
 START=95
 STOP=10
 
+. /usr/libexec/camera-tracer/common.sh
+
 start_service() {
-	local enabled audio_enabled video_enabled video_audio_enabled need_audio
+	local enabled audio_enabled video_enabled video_audio_enabled mqtt_trigger_enabled
+	local mqtt_control_enabled mqtt_host mqtt_trigger_topic audio_device need_audio need_mqtt_trigger
+	local trusted_camera_pause_enabled motion_command
 
 	config_load camera_tracer
 	config_get_bool enabled main enabled 0
 	[ "$enabled" -eq 1 ] || return 0
 
-	mkdir -p /tmp/camera_tracer/raw /tmp/camera_tracer/state
+	mkdir -p /tmp/camera_tracer/raw /tmp/camera_tracer/state /tmp/camera_tracer/control
 	rm -f /tmp/camera_tracer/reserve.lock /tmp/camera_tracer/next_allowed \
-		/tmp/camera_tracer/audio-video-pending /tmp/camera_tracer/audio-record-active \
-		/tmp/camera_tracer/audio-worker-ready
-	rm -rf /tmp/camera_tracer/audio-video-bind.lock \
-		/tmp/camera_tracer/audio-record-control.lock
-	rm -rf /tmp/camera_tracer/state/*
+		/tmp/camera_tracer/synthetic-video-pending /tmp/camera_tracer/audio-record-active \
+		/tmp/camera_tracer/audio-worker-ready /tmp/camera_tracer/camera-paused \
+		/tmp/camera_tracer/motion-session /tmp/camera_tracer/motion-event-active
+	rm -rf /tmp/camera_tracer/synthetic-video-bind.lock \
+		/tmp/camera_tracer/audio-record-control.lock \
+		/tmp/camera_tracer/motion-trigger-dispatch.lock
+	rm -rf /tmp/camera_tracer/state/* /tmp/camera_tracer/control/*
 	printf '%s-%s\n' "$(date +%s)" "$$" > /tmp/camera_tracer/generation
 
+	# Local LuCI/UCI trigger checkboxes define the initial runtime state.
+	# MQTT control can override these files without writing flash. A service
+	# restart/reload resets the runtime state back to the configured defaults.
+	ct_control_init || ct_log "failed to initialize trigger-control state"
+
+	# Keep the original Motion pipeline untouched when trusted-camera pausing is
+	# disabled. When enabled, a small supervisor owns the Motion child and closes
+	# the camera device while a trusted Wi-Fi client is present.
+	config_get_bool trusted_camera_pause_enabled main trusted_camera_pause_enabled 0
+	motion_command=/usr/libexec/camera-tracer/run-motion
+	[ "$trusted_camera_pause_enabled" -eq 1 ] && motion_command=/usr/libexec/camera-tracer/run-motion-supervisor
+
 	procd_open_instance motion
-	procd_set_param command /usr/libexec/camera-tracer/run-motion
+	procd_set_param command "$motion_command"
 	procd_set_param respawn 3600 5 5
 	procd_set_param stdout 1
 	procd_set_param stderr 1
@@ -30,14 +48,37 @@ start_service() {
 	config_get_bool audio_enabled main audio_enabled 0
 	config_get_bool video_enabled main video_enabled 0
 	config_get_bool video_audio_enabled main video_audio_enabled 0
+	config_get_bool mqtt_trigger_enabled main mqtt_trigger_enabled 0
+	config_get_bool mqtt_control_enabled main mqtt_control_enabled 0
+	config_get mqtt_host main mqtt_host ''
+	config_get mqtt_trigger_topic main mqtt_trigger_topic 'camera_tracer/trigger'
+	config_get audio_device main audio_device ''
 	[ "$video_enabled" -eq 1 ] || video_audio_enabled=0
+
+	# Keep one tiny timer worker alive whenever Camera Tracer is enabled.
+	# This avoids relying on a service restart/reload when timer_enabled changes
+	# (or when an older preserved UCI config gains the new option after upgrade).
+	# The worker itself reads the runtime control state and sleeps while disabled.
+	procd_open_instance timer
+	procd_set_param command /usr/libexec/camera-tracer/run-timer
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+
+	# The audio worker is also kept ready for remote MQTT enabling when an
+	# audio device is configured. This avoids a service restart on audio=on.
 	need_audio=0
 	if [ "$audio_enabled" -eq 1 ] || [ "$video_audio_enabled" -eq 1 ]; then
+		need_audio=1
+	elif [ "$mqtt_control_enabled" -eq 1 ] && [ -n "$audio_device" ]; then
 		need_audio=1
 	fi
 
 	if [ "$need_audio" -eq 1 ]; then
-		if [ ! -x /usr/bin/arecord ]; then
+		if [ -z "$audio_device" ]; then
+			logger -t camera-tracer "audio capture requested but no audio device is configured; audio worker not started"
+		elif [ ! -x /usr/bin/arecord ]; then
 			logger -t camera-tracer "audio capture requested but alsa-utils/arecord is not installed; audio worker not started"
 		elif [ ! -r /proc/asound/pcm ]; then
 			logger -t camera-tracer "audio capture requested but no ALSA capture devices are available; audio worker not started"
@@ -53,11 +94,53 @@ start_service() {
 			procd_close_instance
 		fi
 	fi
+
+	# Keep the MQTT-message trigger subscriber alive when MQTT control is enabled
+	# so mqtt=on can activate it at runtime without restarting the service.
+	need_mqtt_trigger=0
+	if [ "$mqtt_trigger_enabled" -eq 1 ] || [ "$mqtt_control_enabled" -eq 1 ]; then
+		need_mqtt_trigger=1
+	fi
+	if [ "$need_mqtt_trigger" -eq 1 ]; then
+		if [ -z "$mqtt_host" ]; then
+			ct_log "MQTT message trigger requested but broker host is empty; trigger worker not started"
+		elif [ -z "$mqtt_trigger_topic" ]; then
+			ct_log "MQTT message trigger requested but trigger topic is empty; trigger worker not started"
+		elif [ ! -x /usr/bin/mosquitto_sub ]; then
+			ct_log "MQTT message trigger requested but mosquitto_sub is not installed; trigger worker not started"
+		else
+			procd_open_instance mqtt-trigger
+			procd_set_param command /usr/libexec/camera-tracer/run-mqtt-trigger
+			procd_set_param respawn 3600 5 5
+			procd_set_param stdout 1
+			procd_set_param stderr 1
+			procd_close_instance
+		fi
+	fi
+
+	if [ "$mqtt_control_enabled" -eq 1 ]; then
+		if [ -z "$mqtt_host" ]; then
+			ct_log "MQTT trigger control enabled but broker host is empty; control worker not started"
+		elif [ ! -x /usr/bin/mosquitto_sub ]; then
+			ct_log "MQTT trigger control enabled but mosquitto_sub is not installed; control worker not started"
+		else
+			procd_open_instance mqtt-control
+			procd_set_param command /usr/libexec/camera-tracer/run-mqtt-control
+			procd_set_param respawn 3600 5 5
+			procd_set_param stdout 1
+			procd_set_param stderr 1
+			procd_close_instance
+		fi
+	fi
 }
 
 stop_service() {
 	rm -f /tmp/camera_tracer/generation /tmp/camera_tracer/audio-record-active \
-		/tmp/camera_tracer/audio-worker-ready
+		/tmp/camera_tracer/audio-worker-ready /tmp/camera_tracer/synthetic-video-pending \
+		/tmp/camera_tracer/camera-paused /tmp/camera_tracer/motion-session \
+		/tmp/camera_tracer/motion-event-active
+	rm -rf /tmp/camera_tracer/control /tmp/camera_tracer/synthetic-video-bind.lock \
+		/tmp/camera_tracer/motion-trigger-dispatch.lock
 }
 
 reload_service() {

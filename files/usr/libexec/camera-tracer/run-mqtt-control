@@ -1,0 +1,55 @@
+#!/bin/sh
+
+. /usr/libexec/camera-tracer/common.sh
+
+ct_load_config
+config_get_bool mqtt_control_enabled main mqtt_control_enabled 0
+[ "$mqtt_control_enabled" -eq 1 ] || exit 0
+
+config_get mqtt_host main mqtt_host ''
+config_get mqtt_port main mqtt_port '1883'
+config_get mqtt_user main mqtt_user ''
+config_get mqtt_password main mqtt_password ''
+config_get_bool mqtt_tls main mqtt_tls 0
+config_get mqtt_cafile main mqtt_cafile '/etc/ssl/certs/ca-certificates.crt'
+config_get mqtt_control_topic main mqtt_control_topic 'camera_tracer/control'
+config_get mqtt_qos main mqtt_qos '1'
+
+[ -n "$mqtt_host" ] || { ct_log "MQTT control broker host is empty"; exit 1; }
+[ -n "$mqtt_control_topic" ] || { ct_log "MQTT control topic is empty"; exit 1; }
+ct_is_uint "$mqtt_port" || mqtt_port=1883
+case "$mqtt_qos" in 0|1|2) ;; *) mqtt_qos=1 ;; esac
+
+set -- -h "$mqtt_host" -p "$mqtt_port" -q "$mqtt_qos" -t "$mqtt_control_topic"
+[ -n "$mqtt_user" ] && set -- "$@" -u "$mqtt_user"
+[ -n "$mqtt_password" ] && set -- "$@" -P "$mqtt_password"
+if [ "$mqtt_tls" -eq 1 ]; then
+	[ -r "$mqtt_cafile" ] || {
+		ct_log "MQTT control TLS enabled but CA file is not readable: $mqtt_cafile"
+		exit 1
+	}
+	set -- "$@" --cafile "$mqtt_cafile"
+fi
+
+ct_log "starting MQTT trigger control subscriber: topic=$mqtt_control_topic"
+
+# Protocol: one UTF-8/ASCII line, partial updates allowed.
+#   motion=1 audio=0 timer=1 mqtt=1
+#   motion=off,timer=on,mqtt=off
+#   all=off
+# Values accepted: 1/0, on/off, true/false, yes/no, enable/disable.
+# Runtime state is kept in /tmp; UCI is never written by MQTT commands.
+/usr/bin/mosquitto_sub "$@" | while IFS= read -r payload; do
+	if ct_control_apply_payload "$payload"; then
+		motion="$(ct_control_read motion 2>/dev/null || printf '0')"
+		audio="$(ct_control_read audio 2>/dev/null || printf '0')"
+		timer="$(ct_control_read timer 2>/dev/null || printf '0')"
+		mqtt="$(ct_control_read mqtt 2>/dev/null || printf '0')"
+		ct_log "MQTT trigger control applied: motion=$motion audio=$audio timer=$timer mqtt=$mqtt"
+		if [ "$audio" = '1' ] && [ ! -r "$CT_BASE/audio-worker-ready" ]; then
+			ct_log "audio trigger enabled by MQTT but audio worker is unavailable; configure an audio device and install alsa-utils/kmod-usb-audio"
+		fi
+	else
+		ct_log "ignored invalid MQTT trigger control payload"
+	fi
+done

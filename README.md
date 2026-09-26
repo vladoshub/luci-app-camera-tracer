@@ -1,10 +1,15 @@
 # luci-app-camera-tracer
 
 Camera Tracer is a LuCI application for OpenWrt that turns a UVC camera into a
-small motion/audio alarm sensor. It uses Motion for visual detection and bounded
-MP4 recording, can optionally use an ALSA microphone as an alarm source and/or
-record microphone audio into the clip, suppresses alarms while trusted Wi-Fi
-clients are present, and can deliver events through MQTT or a local hook
+small motion/audio/timer/MQTT-message alarm sensor. It uses Motion for visual
+detection and bounded MP4 recording, can optionally use an ALSA microphone as an
+alarm source and/or record microphone audio into the clip, can trigger
+periodically from a timer or by receiving a message on a dedicated MQTT topic,
+can optionally stop camera capture while trusted Wi-Fi clients are present,
+and can deliver accepted events through MQTT or a local executable hook.
+Trusted-device presence is used only for the optional camera-capture gate and is
+not re-checked during event delivery. Trigger sources can also
+be enabled or disabled at runtime from one MQTT control topic.
 
 The project was developed for OpenWrt 25.12.x on the Banana Pi BPI-R3 Mini, but
 it is not target-specific. Other OpenWrt devices can use it when the required
@@ -15,42 +20,84 @@ video encoding.
 
 - LuCI configuration page under **Services -> Camera Tracer**.
 - Select a V4L2/UVC camera from detected `/dev/video*` capture devices.
-- Visual motion detection through Motion.
+- Visual motion detection through Motion, with its own enable/disable switch.
 - Optional audio-threshold trigger through ALSA.
-- Visual motion and audio threshold enter the same alarm pipeline.
+- Optional periodic timer trigger with a configurable interval in seconds.
+- Optional MQTT-message trigger on a configurable topic; any received message is
+  one trigger request.
+- Motion, audio, timer and MQTT-message triggers enter the same alarm pipeline
+  and share the same global holdoff.
 - Immediate JPEG capture to `/tmp/camera_tracer/`.
 - Optional bounded MP4 recording to `/tmp/camera_tracer/`.
 - Optional microphone track muxed into the final MP4 as AAC.
-- Trusted-device suppression using DHCP IP -> MAC resolution plus the current
+- Trusted-device presence using DHCP IP -> MAC resolution plus the current
   Wi-Fi association list.
-- Configurable trusted-device delay and trigger holdoff.
+- Optional trusted-presence camera gate: stop Motion/close the UVC camera while
+  any trusted client is present, then resume when all trusted clients disappear.
+- Configurable trusted-presence polling interval (seconds) and trigger holdoff.
 - Raw JPEG/MP4 publication over MQTT plus a JSON event topic.
+- Optional MQTT runtime control for motion/audio/timer/MQTT-message trigger enable states.
 - Optional executable alarm hook.
+- Included generic HTTP multipart hook example using a deliberately non-resolving `.invalid` endpoint.
 - Runtime media stays in `/tmp` and therefore does not continuously write to
   flash storage.
 
 ## Alarm flow
 
 ```text
+trusted Wi-Fi presence ----> camera capture enabled / paused
+                                      |
+                                      v
 visual motion ------------------\
-                                +--> accepted alarm
-sound threshold ----------------/         |
+sound threshold -----------------+--> accepted alarm
+periodic timer ------------------+         |
+MQTT trigger message -------------/         |
                                           +--> save JPEG immediately
-                                          |
+                                          +--> publish JPEG/event MQTT immediately
                                           +--> optionally record MP4
-                                          |       + optional microphone audio
-                                          |
-                                          +--> wait trusted-device timeout
-                                                  |
-                                    trusted Wi-Fi client present?
-                                       |                      |
-                                      yes                    no
-                                       |                      |
-                                  suppress alarm      MQTT and/or hook
+                                                  + optional microphone audio
+                                                  + MP4 MQTT/hook after close
 ```
 
-The JPEG is saved immediately when an alarm is accepted. The trusted-device
-wait only delays external delivery; it does not delay the initial capture.
+Trusted-device presence is checked only by the camera supervisor. It is not
+queried again after an alarm is accepted and does not delay MQTT or hook
+delivery. Timer ticks and MQTT-message trigger requests are never queued: if the
+shared trigger holdoff is still active, the request is discarded. This is also
+what happens when the configured timer interval is shorter than the effective
+holdoff.
+
+## Trusted-presence camera gate
+
+Enable **Pause camera while a trusted device is present** to add a coarse
+pre-trigger presence gate. Camera Tracer performs an immediate trusted-device
+check when the service starts, then repeats it at **Trusted presence check
+interval (seconds)** (default 10 seconds, minimum 5 seconds).
+
+When at least one configured trusted client is currently associated to Wi-Fi,
+Camera Tracer stops Motion. That closes the UVC camera device, so frames are not
+read or processed while the gate is paused. Timer/audio/MQTT trigger requests
+are rejected at the shared event entry point while paused and therefore do not
+start the JPEG/video alarm pipeline. When all trusted clients disappear, Motion
+is started again and the existing camera pipeline resumes unchanged.
+
+This gate is the only trusted-device presence mechanism. A join/leave can take
+up to one polling interval to be noticed. Once an alarm has been accepted, it is
+not suppressed later because a trusted device appears, and MQTT/hook delivery
+does not perform another Wi-Fi association query.
+
+Each Motion process also receives a unique runtime session id. Motion restarts its
+internal event numbering from 1 when camera capture resumes, so Camera Tracer
+includes the session id in visual/synthetic media state and callback mappings.
+This prevents event `1`, `2`, etc. from a resumed camera from colliding with
+state left by the previous Motion process.
+
+If the trusted-IP list is empty, enabling the camera gate is a no-op and camera
+capture remains active.
+
+The polling interval is stored in seconds in 0.6.2 and later. The allowed range is
+5..3600 seconds and the default is 10 seconds. When upgrading from 0.6.0/0.6.1,
+the legacy minute value is converted to the equivalent number of seconds at
+runtime; saving the LuCI page writes the new seconds option.
 
 ## Required OpenWrt packages
 
@@ -275,8 +322,13 @@ Enabled:                     yes
 Camera:                      /dev/video0
 Resolution:                  640x480
 FPS:                         5
+Motion trigger:              enabled
 Video threshold:             1500
-Trusted-device timeout:      5 s
+Minimum motion frames:       2
+Timer trigger:               disabled
+Timer interval:              60 s
+Pause camera on trusted:     disabled
+Trusted check interval:      10 s
 Trigger holdoff:             Auto
 Photo:                       enabled
 Photo filename:              last.jpg
@@ -297,6 +349,33 @@ Final media paths are fixed below:
 
 The directory cannot be changed from LuCI by design.
 
+The **Minimum motion frames** setting maps directly to Motion's
+`minimum_motion_frames` option. Camera Tracer accepts values from 1 to 30 and
+defaults to 2. At a fixed FPS, increasing it requires motion to persist for more
+frames before a visual event is accepted; for example, 2 frames are about 133 ms
+at 15 FPS and about 67 ms at 30 FPS.
+
+## Timer trigger
+
+The timer is a first-class trigger source. Enable **Enable timer trigger** and
+set **Timer interval (seconds)** from 1 to 86400 seconds. When a timer tick is
+accepted it follows the same pipeline as motion/audio: immediate JPEG capture,
+optional MP4 and microphone audio, MQTT publishing, and the local hook.
+
+The timer does not wait for an earlier alarm to finish and does not build a
+queue. Every tick passes through the same global trigger reservation. If the
+current time is still before `next_allowed`, the tick exits immediately. For
+example, with a 10-second effective holdoff and a 3-second timer, ticks at 3, 6
+and 9 seconds after an accepted event are simply ignored; a later tick can be
+accepted after the holdoff expires. Enabling the timer over MQTT starts a fresh
+interval; it does not fire immediately.
+
+With video enabled, timer/audio/MQTT triggers require a fresh Motion movie. If
+Motion already has a natural-motion event open, Camera Tracer first requests
+`eventend`, waits for the matching `on_event_end` marker, and only then requests
+`eventstart` for the synthetic alarm. Visual motion alarms do not force this
+boundary; they remain attached to Motion's normal movie segments.
+
 ## Video safety limits
 
 Video recording is disabled by default. When enabled, LuCI exposes bounded
@@ -316,23 +395,33 @@ an AAC microphone track using a second `ffmpeg` mux step.
 The automatic holdoff is:
 
 ```text
-2 + max(trusted-device wait, video maximum duration)
+2 seconds                         (video disabled)
+2 + video maximum duration        (video enabled)
 ```
 
-when video is enabled. This prevents a new accepted event from overwriting the
-previous event's `last.jpg` / `last.mp4` while the clip is still being created.
-A manually configured holdoff overrides the automatic value.
+This prevents a new accepted event from overwriting the previous event's
+`last.jpg` / `last.mp4` while the clip is still being created. A manually
+configured holdoff overrides the automatic value.
+
+Visual motion alarms are driven by Motion's `on_motion_detected` callback, not by
+`picture_output first`. Motion can keep one internal event open for a long time
+when movement never fully stops; Camera Tracer still becomes eligible for a new
+visual alarm as soon as the shared holdoff expires. Rejected motion callbacks do
+not request a JPEG snapshot.
 
 ## Audio configuration
 
 Audio functions are independent:
 
 - **Enable audio trigger** — loud sound can start the same alarm chain as visual
-  motion.
+  motion or the timer. This checkbox is also the default runtime state restored
+  after a Camera Tracer restart/reload.
 - **Record microphone audio in MP4** — accepted video clips receive a microphone
   track even if sound itself is not used as a trigger.
 
-Both options may be enabled at the same time. The ALSA capture device is opened
+Both options may be enabled at the same time.
+
+The audio detector uses 50 ms AC-RMS windows (the per-window DC offset is removed before dBFS calculation). **Require quiet re-arm after audio trigger** is enabled by default: after an alarm, the detector rearms only after the level has stayed below `threshold - hysteresis` for the configured quiet re-arm interval (defaults: 6 dB and 500 ms). If this checkbox is disabled, there is no release-level/quiet-time gate: sustained sound above the threshold continues to present new audio-trigger opportunities after each configured threshold-duration window, while the shared Camera Tracer holdoff still decides which alarms are actually accepted. This behavior is independent of Motion `event_gap` and the visual-event lifecycle. The ALSA capture device is opened
 once and the stream is shared internally.
 
 Suggested starting point:
@@ -359,7 +448,12 @@ firmware.
 
 ## MQTT
 
-MQTT is optional. Camera Tracer publishes three independent payload types:
+MQTT publishing and MQTT trigger control are independent checkboxes and use the
+same broker host/port/credentials/TLS settings.
+
+### Publishing
+
+Camera Tracer can publish three independent payload types:
 
 ```text
 camera_tracer/image   raw JPEG binary payload
@@ -370,12 +464,86 @@ camera_tracer/event   JSON event payload
 Example event:
 
 ```json
-{"event":"trigger","source":"video","timestamp":"2026-09-13T18:30:00+0300","photo":"last.jpg","video_pending":true,"audio_requested":true}
+{"event":"trigger","source":"timer","timestamp":"2026-09-16T23:55:00+0300","photo":"last.jpg","video_pending":true,"audio_requested":true}
 ```
 
-JPEG and MP4 are sent as binary MQTT payloads; they are not Base64 encoded.
-Media messages are not retained. Make sure the broker and consumers accept
-packets at least as large as the configured maximum MP4 size.
+`source` is `video` for visual Motion events, `audio` for microphone threshold
+events, `timer` for periodic events, or `mqtt` for MQTT-message-triggered
+events. JPEG and MP4 are sent as binary MQTT payloads; they are not Base64
+encoded. Media messages are not retained. Make
+sure the broker and consumers accept packets at least as large as the configured
+maximum MP4 size.
+
+
+### MQTT message trigger
+
+Enable **MQTT message trigger** and set a dedicated topic, default:
+
+```text
+camera_tracer/trigger
+```
+
+Every message received on that topic requests one alarm. The message body is
+ignored. The request enters exactly the same global reservation/holdoff, JPEG,
+optional MP4+audio and delivery path as motion, audio and timer alarms. If the global holdoff is still active, the MQTT trigger request is
+dropped immediately and is not queued for later.
+
+Use a dedicated, non-output topic. In particular, do not reuse
+`camera_tracer/event`, `camera_tracer/image` or `camera_tracer/video` as the
+trigger topic. Retained messages are broker messages too, so a retained trigger
+may fire when the subscriber reconnects; use non-retained publications for
+command-like trigger messages unless that behavior is intentional.
+
+Example:
+
+```sh
+mosquitto_pub -h 192.168.1.10 -t camera_tracer/trigger -m trigger
+```
+
+The payload may be any text because Camera Tracer ignores it.
+
+### Runtime trigger control
+
+Enable **MQTT trigger control** and set one topic, default:
+
+```text
+camera_tracer/control
+```
+
+Camera Tracer subscribes with `mosquitto_sub`. The payload is deliberately a
+small dependency-free key/value protocol rather than JSON. A single message can
+change any subset of trigger sources:
+
+```text
+motion=1 audio=0 timer=1 mqtt=1
+```
+
+Comma-separated form is also accepted:
+
+```text
+motion=off,timer=on,mqtt=on
+```
+
+To change every trigger source at once:
+
+```text
+all=off
+all=on
+```
+
+Accepted boolean values are `1/0`, `on/off`, `true/false`, `yes/no`, and
+`enable/disable` (also `enabled/disabled`). Unknown or invalid payloads are
+ignored. Omitted keys keep their current value.
+
+These changes are **runtime-only** and are stored below `/tmp/camera_tracer/`;
+MQTT control never writes UCI or flash. Restarting/reloading Camera Tracer resets
+motion/audio/timer/MQTT-message states to their LuCI/UCI checkboxes. If you want
+a broker to reapply desired state after reconnect/restart, publish the control message as a
+retained MQTT message.
+
+MQTT control may enable audio remotely even when the local audio-trigger checkbox
+is off. For that to work, configure an audio device and install the optional
+audio dependencies. Motion, timer and MQTT-message trigger control do not need ALSA.
 
 ## Alarm hook interface
 
@@ -397,17 +565,44 @@ CAMERA_TRACER_TRIGGER_EPOCH
 CAMERA_TRACER_TRIGGER_TIMESTAMP
 ```
 
-With video enabled, the hook runs after the MP4 has been closed so it can send
-both the JPEG and the final video. With video disabled, it runs immediately
-after the trusted-device decision.
+`<source>` is `video`, `audio`, `timer` or `mqtt`. With video enabled, the hook runs
+after the MP4 has been closed so it can send both the JPEG and the final video.
+With video disabled, it runs immediately after the alarm is accepted.
 
+## Generic HTTP hook example
 
-The example needs `curl`:
+The package installs a deliberately non-functional HTTP multipart example:
+
+```text
+/usr/share/camera-tracer/examples/example-hook.sh
+/usr/share/camera-tracer/examples/example-hook.conf.example
+```
+
+The example uses the reserved `.invalid` TLD, so it will not contact a real
+service until you replace the endpoint with one you control. It requires `curl`:
 
 ```sh
 apk add curl
 ```
 
+Install a working copy:
+
+```sh
+cp /usr/share/camera-tracer/examples/example-hook.sh \
+  /root/camera-alarm.sh
+cp /usr/share/camera-tracer/examples/example-hook.conf.example \
+  /etc/camera-tracer-hook.conf
+
+chmod 700 /root/camera-alarm.sh
+chmod 600 /etc/camera-tracer-hook.conf
+```
+
+Edit `/etc/camera-tracer-hook.conf` and replace the example values:
+
+```sh
+ENDPOINT='https://camera-tracer.invalid/v1/events'
+API_TOKEN='replace_me'
+```
 
 Then set the Camera Tracer alarm script to:
 
@@ -423,6 +618,11 @@ uci commit camera_tracer
 /etc/init.d/camera_tracer restart
 ```
 
+The example submits metadata plus the accepted JPEG and optional MP4 as a
+multipart request. It forces `curl --http1.1` to avoid transport-specific
+multipart upload issues on some WAN/NAT paths. The endpoint is intentionally
+fictional; adapt the field names, authentication and response handling to your
+own receiver.
 
 ## Validation
 
@@ -433,13 +633,74 @@ Run the repository's static checks on a Linux development host:
 ```
 
 The script checks shell/BusyBox syntax, JSON, LuCI JavaScript syntax when Node is
-available, helper behavior, trusted-client resolution, audio state handling,
+available, helper behavior, trusted-client resolution, trusted-presence camera-gate state/path, drain safety and iwinfo watchdog, trigger-control state, timer path, audio state handling,
 optional dependency rules and package install staging.
 
 See [VALIDATION.md](VALIDATION.md) for the current validation matrix and the
 hardware tests that still require a real router/camera/microphone.
 
 GitHub Actions also runs the same static check for pushes and pull requests.
+
+## Trusted-presence camera gate diagnostics
+
+When the gate is enabled, these commands show its configuration and runtime
+state:
+
+```sh
+uci -q get camera_tracer.main.trusted_camera_pause_enabled
+uci -q get camera_tracer.main.trusted_check_interval_seconds
+pgrep -af 'run-motion-supervisor|run-motion|motion'
+ls -l /tmp/camera_tracer/camera-paused 2>/dev/null
+logread | grep 'trusted presence gate' | tail -n 30
+```
+
+`/tmp/camera_tracer/camera-paused` is published as soon as the coarse presence
+gate detects a trusted client. From that moment new motion/audio/timer/MQTT
+triggers are rejected before entering the alarm/media pipeline. If an accepted
+MP4 event is already recording, Motion is allowed to finish and close that movie
+before the supervisor closes the camera. The raw-movie close is detected via the
+existing per-event `finalize.lock`, so later muxing/MQTT/hook work does not keep
+the camera open unnecessarily.
+
+The drain wait is bounded to `video_max_time + 15 seconds` (clamped to
+20..180 seconds). If an event cannot close before that deadline, Camera Tracer
+marks the unfinished media finalized/abandoned, stops microphone appends,
+removes pending synthetic-video state, and then terminates Motion. This prevents
+a stale `audio.pcm` from growing indefinitely in tmpfs.
+
+Trusted Wi-Fi association queries are also bounded: each `iwinfo ... assoclist`
+probe has a small watchdog (3 seconds by default), so a stuck Wi-Fi query cannot
+freeze the presence supervisor forever.
+
+No trusted-device query runs in `process-event`, `movie-end`, the local hook,
+or MQTT delivery. The supervisor is the single owner of trusted presence and
+uses it only to start/stop camera capture.
+
+## Timer / synthetic trigger diagnostics
+
+On the router, these commands confirm the timer worker, runtime state and Motion localhost control path:
+
+```sh
+uci -q get camera_tracer.main.timer_enabled
+uci -q get camera_tracer.main.timer_interval
+cat /tmp/camera_tracer/control/timer 2>/dev/null
+pgrep -af run-timer
+cat /tmp/camera_tracer/motion-session 2>/dev/null
+cat /tmp/camera_tracer/motion-event-active 2>/dev/null
+grep -E 'webcontrol_(port|localhost|parms)' /tmp/camera_tracer/motion.conf
+logread | grep camera-tracer | tail -n 80
+```
+
+A manual synthetic trigger can be tested with:
+
+```sh
+/usr/libexec/camera-tracer/event timer
+```
+
+A successful synthetic-video path logs the Motion session/event binding, for
+example `bound timer trigger to Motion session ... event ...`. If a natural
+Motion event was open, an earlier log reports that Camera Tracer is ending it
+before starting the synthetic movie.
 
 ## Troubleshooting
 
@@ -486,7 +747,7 @@ arecord -l
 │   ├── etc/init.d/camera_tracer     procd service
 │   ├── usr/libexec/camera-tracer/   runtime workers/helpers
 │   └── www/luci-static/...          LuCI JavaScript view
-├── examples/                        sh scripts (hook)/config examples
+├── examples/                        generic hook/config examples
 ├── tests/static-check.sh            host-side static validation
 ├── VALIDATION.md                    validation status
 ├── CHANGELOG.md                     release history

@@ -1,0 +1,65 @@
+#!/bin/sh
+
+# Motion may call on_motion_detected repeatedly while one Motion event remains
+# open. Keep the hot path tiny during Camera Tracer's global holdoff, then
+# dispatch exactly one visual alarm attempt when the holdoff expires.
+BASE='/tmp/camera_tracer'
+motion_session="${1:-}"
+event_id="${2:-}"
+
+case "$motion_session" in
+	''|*[!A-Za-z0-9._-]*) exit 0 ;;
+esac
+case "$event_id" in
+	''|*[!0-9]*) exit 0 ;;
+esac
+
+# Ignore callbacks from a Motion process that was superseded by a trusted-device
+# pause/resume or another Motion restart.
+current_session=''
+[ -r "$BASE/motion-session" ] && read -r current_session < "$BASE/motion-session" || true
+[ "$current_session" = "$motion_session" ] || exit 0
+
+# Runtime motion control is mirrored into tmpfs by Camera Tracer. Check it here
+# so motion=off does not turn continuous scene motion into a stream of heavier
+# event-script processes. The full event entry point still re-checks the state.
+if [ -r "$BASE/control/motion" ]; then
+	read -r motion_enabled < "$BASE/control/motion" || motion_enabled=0
+	[ "$motion_enabled" = '1' ] || exit 0
+fi
+
+# The trusted-device supervisor publishes this marker before it starts draining
+# and stopping Motion. Avoid dispatching work during that shutdown window.
+[ -e "$BASE/camera-paused" ] && exit 0
+
+now="$(date +%s)"
+next=0
+if [ -r "$BASE/next_allowed" ]; then
+	read -r next < "$BASE/next_allowed" || next=0
+fi
+case "$next" in
+	''|*[!0-9]*) next=0 ;;
+esac
+[ "$now" -lt "$next" ] && exit 0
+
+# Coalesce callbacks that arrive together at high FPS. The shared reservation
+# in event remains the authoritative cross-source holdoff/lock.
+lock="$BASE/motion-trigger-dispatch.lock"
+mkdir -p "$BASE"
+mkdir "$lock" 2>/dev/null || exit 0
+trap 'rmdir "$lock" 2>/dev/null || true' EXIT INT TERM
+
+# Re-check after winning the dispatch lock because another trigger source may
+# have reserved the global holdoff while this callback was waiting to run.
+now="$(date +%s)"
+next=0
+if [ -r "$BASE/next_allowed" ]; then
+	read -r next < "$BASE/next_allowed" || next=0
+fi
+case "$next" in
+	''|*[!0-9]*) next=0 ;;
+esac
+[ "$now" -lt "$next" ] && exit 0
+
+/usr/libexec/camera-tracer/event video '' "$event_id" "$motion_session"
+exit $?

@@ -5,26 +5,46 @@
 source_type="${1:-}"
 input_photo="${2:-}"
 event_id="${3:-}"
+motion_session="${4:-}"
 
 case "$source_type" in
-	video|audio) ;;
+	video|audio|timer|mqtt) ;;
 	*) exit 2 ;;
 esac
 
 ct_load_config
 config_get_bool enabled main enabled 0
 [ "$enabled" -eq 1 ] || exit 0
-ct_get_trusted_ips
 
-# The snapshot created for an audio trigger also passes through Motion's
-# on_picture_save hook. Ignore it there; the audio branch below owns it.
-if [ "$source_type" = video ]; then
-	case "${input_photo##*/}" in
-		audio-snapshot.jpg|lastsnap.jpg) exit 0 ;;
-	esac
-	[ -f "$input_photo" ] || exit 0
+# Trusted-presence camera state. The supervisor publishes this state before
+# closing Motion, so callbacks racing with camera shutdown cannot enter a new
+# alarm/media pipeline. This does not query trusted devices here; all presence
+# checks are owned by run-motion-supervisor.
+if ct_camera_paused; then
+	[ "$source_type" = video ] && rm -f "$input_photo"
+	exit 0
 fi
 
+# Visual-motion callbacks no longer depend on Motion's picture_output=first.
+# on_motion_detected supplies only the Motion event id; after the global holdoff
+# reservation succeeds we ask Motion for a fresh snapshot. This lets a long-lived
+# Motion event generate another Camera Tracer alarm once the holdoff expires.
+# Keep accepting an explicit photo path for compatibility with older/manual calls.
+if [ "$source_type" = video ] && [ -n "$input_photo" ] && [ ! -f "$input_photo" ]; then
+	exit 0
+fi
+
+# LuCI checkboxes establish the initial runtime state; optional MQTT control can
+# override it in /tmp. Disabled sources are ignored before reserving the global
+# trigger lock.
+if ! ct_trigger_enabled "$source_type"; then
+	[ "$source_type" = video ] && rm -f "$input_photo"
+	exit 0
+fi
+
+# One global reservation protects last.jpg/last.mp4 for all trigger sources.
+# Timer ticks that arrive before next_allowed are therefore discarded rather
+# than queued or delayed, including when timer_interval < effective holdoff.
 if ! ct_reserve_event; then
 	[ "$source_type" = video ] && rm -f "$input_photo"
 	exit 0
@@ -36,25 +56,45 @@ if ! ct_safe_photo_name "$photo_name"; then
 	photo_name='last.jpg'
 fi
 
-if [ "$source_type" = audio ]; then
-	if [ ! -x /usr/bin/arecord ]; then
-		ct_log "audio trigger requested but alsa-utils/arecord is not installed"
-		exit 1
-	fi
-	rm -f "$CT_RAW/audio-snapshot.jpg" "$CT_RAW/lastsnap.jpg"
-	if ! ct_motion_action snapshot; then
-		ct_log "audio trigger accepted but Motion snapshot request failed"
-		exit 1
-	fi
-	input_photo="$CT_RAW/audio-snapshot.jpg"
-	if [ ! -f "$input_photo" ]; then
-		sleep 1
-	fi
-	[ -f "$input_photo" ] || {
-		ct_log "audio trigger accepted but snapshot file was not created"
-		exit 1
-	}
+if [ "$source_type" = audio ] && [ ! -x /usr/bin/arecord ]; then
+	ct_log "audio trigger requested but alsa-utils/arecord is not installed"
+	exit 1
 fi
+
+case "$source_type" in
+	video)
+		if [ -z "$input_photo" ]; then
+			rm -f "$CT_RAW/synthetic-snapshot.jpg"
+			if ! ct_motion_action snapshot; then
+				ct_log "video trigger accepted but Motion snapshot request failed"
+				exit 1
+			fi
+			input_photo="$CT_RAW/synthetic-snapshot.jpg"
+			if [ ! -f "$input_photo" ]; then
+				sleep 1
+			fi
+			[ -f "$input_photo" ] || {
+				ct_log "video trigger accepted but snapshot file was not created"
+				exit 1
+			}
+		fi
+		;;
+	audio|timer|mqtt)
+		rm -f "$CT_RAW/synthetic-snapshot.jpg" "$CT_RAW/audio-snapshot.jpg" "$CT_RAW/lastsnap.jpg"
+		if ! ct_motion_action snapshot; then
+			ct_log "$source_type trigger accepted but Motion snapshot request failed"
+			exit 1
+		fi
+		input_photo="$CT_RAW/synthetic-snapshot.jpg"
+		if [ ! -f "$input_photo" ]; then
+			sleep 1
+		fi
+		[ -f "$input_photo" ] || {
+			ct_log "$source_type trigger accepted but snapshot file was not created"
+			exit 1
+		}
+		;;
+esac
 
 final_photo="$CT_BASE/$photo_name"
 tmp_photo="$CT_BASE/.${photo_name}.tmp.$$"
@@ -74,21 +114,33 @@ trigger_timestamp="$(date '+%Y-%m-%dT%H:%M:%S%z')"
 generation="$(cat "$CT_BASE/generation" 2>/dev/null)"
 [ -n "$generation" ] || exit 0
 
+# Visual callbacks carry the Motion session that produced them. Synthetic
+# triggers read the current session after the snapshot request. Session-scoped
+# state prevents Motion event ids (which restart from 1 after camera resume)
+# from colliding with state left by a previous Motion process.
+if [ -z "$motion_session" ]; then
+	motion_session="$(ct_motion_session_read 2>/dev/null || true)"
+fi
+if ! ct_motion_session_is_current "$motion_session"; then
+	ct_log "$source_type trigger accepted but Motion session changed; continuing with photo only"
+	motion_session=''
+fi
+
 event_dir=''
 config_get_bool video_enabled main video_enabled 0
 config_get_bool video_audio_enabled main video_audio_enabled 0
 [ "$video_enabled" -eq 1 ] || video_audio_enabled=0
 state_id=''
-if [ "$video_enabled" -eq 1 ]; then
+if [ "$video_enabled" -eq 1 ] && [ -n "$motion_session" ]; then
 	case "$source_type" in
 		video)
-			ct_is_uint "$event_id" && state_id="$event_id"
+			ct_is_uint "$event_id" && state_id="${motion_session}-event-${event_id}"
 			;;
-		audio)
-			# Motion does not expose the new event id to the webcontrol caller.
-			# Use the trigger epoch for Camera Tracer state and bind it to the
-			# Motion event id later from on_movie_start.
-			state_id="$CT_TRIGGER_EPOCH"
+		audio|timer|mqtt)
+			# Motion does not expose the event id created by webcontrol eventstart.
+			# Use a session-scoped trigger key temporarily; on_movie_start binds the
+			# generated Motion event id back to this state directory.
+			state_id="${motion_session}-synthetic-${CT_TRIGGER_EPOCH}"
 			;;
 	esac
 fi
@@ -98,16 +150,16 @@ if [ -n "$state_id" ]; then
 	if [ -n "$event_dir" ]; then
 		mkdir -p "$event_dir"
 		ct_state_write "$event_dir" generation "$generation"
+		ct_state_write "$event_dir" motion_session "$motion_session"
 		ct_state_write "$event_dir" source "$source_type"
 		ct_state_write "$event_dir" photo "$final_photo"
 		ct_state_write "$event_dir" epoch "$CT_TRIGGER_EPOCH"
 		ct_state_write "$event_dir" timestamp "$trigger_timestamp"
-		ct_state_write "$event_dir" decision 'pending'
 
 		# Optional microphone audio is captured by the single long-lived ALSA
 		# worker. The event only toggles which accepted state directory receives
-		# PCM bytes, so audio threshold detection and clip recording never need to
-		# open the USB microphone twice.
+		# PCM bytes, so trigger detection and clip recording never open the USB
+		# microphone twice.
 		if [ "$video_audio_enabled" -eq 1 ]; then
 			config_get audio_sample_rate main audio_sample_rate '16000'
 			case "$audio_sample_rate" in
@@ -132,7 +184,7 @@ if [ -n "$state_id" ]; then
 			ct_state_write "$event_dir" audio_delay_ms "$audio_delay_ms"
 
 			if [ -r "$CT_BASE/audio-worker-ready" ]; then
-				if ct_audio_record_start "$generation" "$event_dir"; then
+				if ct_audio_record_start "$generation" "$motion_session" "$event_dir"; then
 					ct_log "started microphone capture for $source_type event"
 				else
 					ct_log "could not arm microphone capture for event"
@@ -144,27 +196,37 @@ if [ -n "$state_id" ]; then
 	fi
 fi
 
-# Audio is a first-class trigger. With video enabled, force Motion to start an
-# event after the immediate snapshot has been captured. on_movie_start binds
-# Motion's generated event id back to this Camera Tracer event. A separate
-# worker forcibly ends the event so continuous sound can never record forever.
-if [ "$source_type" = audio ] && [ "$video_enabled" -eq 1 ] && [ -n "$event_dir" ]; then
-	config_get video_max_time main video_max_time '15'
-	ct_is_uint "$video_max_time" || video_max_time=15
-	[ "$video_max_time" -ge 1 ] 2>/dev/null || video_max_time=1
-	[ "$video_max_time" -le 120 ] 2>/dev/null || video_max_time=120
+# Audio, timer and MQTT-message alarms are synthetic first-class triggers. With video enabled they
+# force Motion to start one bounded movie after the immediate snapshot. The
+# pending marker is consumed by on_movie_start, and synthetic-video-stop ends
+# the forced event at video_max_time so it cannot create unlimited segments.
+case "$source_type" in
+	audio|timer|mqtt)
+		if [ "$video_enabled" -eq 1 ] && [ -n "$event_dir" ]; then
+			config_get video_max_time main video_max_time '15'
+			ct_is_uint "$video_max_time" || video_max_time=15
+			[ "$video_max_time" -ge 1 ] 2>/dev/null || video_max_time=1
+			[ "$video_max_time" -le 120 ] 2>/dev/null || video_max_time=120
 
-	if ct_audio_pending_write "$generation" "$event_dir" && ct_motion_action eventstart; then
-		/usr/libexec/camera-tracer/audio-video-stop \
-			"$generation" "$event_dir" "$video_max_time" >/dev/null 2>&1 &
-	else
-		ct_log "audio trigger accepted but Motion video event could not be started; continuing with photo only"
-		ct_audio_record_stop "$event_dir"
-		rm -f "$CT_BASE/audio-video-pending"
-		rm -rf "$event_dir"
-		event_dir=''
-	fi
-fi
+			# A synthetic alarm must own a fresh Motion event/movie. If natural
+			# motion already has an event open, close it first and wait for the
+			# on_event_end callback before issuing eventstart. This makes timer,
+			# audio and MQTT video independent of Motion's long-lived event state.
+			if ct_motion_prepare_synthetic_event "$motion_session" "$source_type" && \
+				ct_synthetic_pending_write "$generation" "$motion_session" "$event_dir" && \
+				ct_motion_action eventstart; then
+				/usr/libexec/camera-tracer/synthetic-video-stop \
+					"$generation" "$motion_session" "$event_dir" "$video_max_time" >/dev/null 2>&1 &
+			else
+				ct_log "$source_type trigger accepted but a fresh Motion video event could not be started; continuing with photo only"
+				ct_audio_record_stop "$event_dir"
+				rm -f "$CT_BASE/synthetic-video-pending"
+				rm -rf "$event_dir"
+				event_dir=''
+			fi
+		fi
+		;;
+esac
 
 ct_log "accepted $source_type trigger; photo=$final_photo holdoff=${CT_HOLDOFF}s event=${event_id:-none}"
 /usr/libexec/camera-tracer/process-event \
