@@ -323,6 +323,14 @@ chmod +x "$TMP/synthetic-boundary-test.sh"
 sh "$TMP/synthetic-boundary-test.sh" "$TMP/common.sh" "$TMP/synthetic-boundary" || fail "synthetic Motion event boundary"
 pass "synthetic Motion event boundary"
 
+# If Motion acknowledges a synthetic eventstart but no movie-start callback binds
+# the pending marker, synthetic-video-stop must still clear Motion's user-event
+# latch. The fail-safe is guarded by exact generation/session/event ownership.
+grep -Fq 'pending_is_ours=1' files/usr/libexec/camera-tracer/synthetic-video-stop || fail "synthetic fail-safe ownership marker"
+grep -Fq 'synthetic video did not bind in Motion session $expected_session; issuing fail-safe eventend' files/usr/libexec/camera-tracer/synthetic-video-stop || fail "synthetic fail-safe log/path"
+grep -Fq 'ct_motion_action eventend' files/usr/libexec/camera-tracer/synthetic-video-stop || fail "synthetic fail-safe eventend"
+pass "synthetic fail-safe eventend"
+
 # Verify runtime trigger state and the dependency-free MQTT control payload grammar.
 cat > "$TMP/control-test.sh" <<'EOS'
 #!/bin/sh

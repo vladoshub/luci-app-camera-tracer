@@ -757,3 +757,7 @@ arecord -l
 ## License
 
 GPL-2.0-or-later. See [LICENSE](LICENSE).
+
+### Synthetic event fail-safe (0.6.8-r3)
+
+If Motion acknowledges a timer/audio/MQTT `eventstart` but no `on_movie_start` callback binds the pending alarm, Camera Tracer issues a fail-safe `eventend` at the clip deadline. This prevents a failed synthetic movie start from leaving Motion in a latched user-event state that repeatedly feeds visual callbacks.

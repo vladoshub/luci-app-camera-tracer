@@ -1,7 +1,7 @@
 # Validation report
 
-Validation date: 2026-09-26
-Version: 0.6.8-r2
+Validation date: 2026-09-29
+Version: 0.6.8-r3
 
 ## Passed locally
 
@@ -18,6 +18,7 @@ Version: 0.6.8-r2
 - session-scoped visual state and synthetic event-id mappings, including generation/session validation for pending video and microphone-recording markers;
 - synthetic timer/audio/MQTT event-boundary helper behavior: an already-open Motion event is ended and observed idle before a fresh synthetic `eventstart`;
 - bounded synthetic stop ownership: `eventend` is issued only for the Motion event id actually bound to that synthetic alarm;
+- unbound synthetic fail-safe: if Motion accepted synthetic `eventstart` but `on_movie_start` never consumes the exact generation/session pending marker, the stop worker issues a bounded fail-safe `eventend` so the Motion user-event latch cannot remain asserted indefinitely;
 - verification that `picture_output first` / `on_picture_save` are no longer used as the visual alarm source and that accepted visual alarms request a fresh Motion snapshot;
 - helper behavior for safe JPEG/MP4 names, JSON escaping and automatic holdoff;
 - automatic holdoff based only on video duration (or 2 seconds without video);
@@ -55,6 +56,7 @@ PASS: no post-trigger trusted decision
 PASS: iwinfo watchdog
 PASS: synthetic pending state
 PASS: synthetic Motion event boundary
+PASS: synthetic fail-safe eventend
 PASS: MQTT trigger control state
 PASS: timer trigger path
 PASS: synthetic trigger webcontrol

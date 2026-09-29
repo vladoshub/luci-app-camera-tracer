@@ -16,16 +16,54 @@ sleep "$duration"
 current_generation="$(cat "$CT_BASE/generation" 2>/dev/null)"
 [ -n "$expected_generation" ] && [ "$current_generation" = "$expected_generation" ] || exit 0
 
-# End only the Motion event actually bound to this synthetic trigger. The old
-# implementation called eventend unconditionally after the timer, which could
-# terminate an unrelated event if the synthetic event had already closed.
-if ct_motion_session_is_current "$expected_session" && [ -d "$event_dir" ]; then
-	bound_id="$(ct_state_read "$event_dir" motion_event_id 2>/dev/null || true)"
-	active="$(ct_motion_event_active_read 2>/dev/null || true)"
-	active_session="$(printf '%s\n' "$active" | sed -n '1p')"
-	active_id="$(printf '%s\n' "$active" | sed -n '2p')"
-	if ct_is_uint "$bound_id" && [ "$active_session" = "$expected_session" ] && [ "$active_id" = "$bound_id" ]; then
-		ct_motion_action eventend || ct_log "failed to end forced synthetic video event $bound_id"
+# Snapshot pending ownership before attempting to stop the event. A successful
+# on_movie_start removes this marker. If it is still ours after the requested
+# duration, Motion acknowledged eventstart but Camera Tracer never observed a
+# movie binding. In that failure mode Motion can otherwise keep its webcontrol
+# user-event latch asserted and repeatedly invoke on_motion_detected forever.
+pending="$(ct_synthetic_pending_read 2>/dev/null || true)"
+pending_generation="$(printf '%s\n' "$pending" | sed -n '1p')"
+pending_session="$(printf '%s\n' "$pending" | sed -n '2p')"
+pending_dir="$(printf '%s\n' "$pending" | sed -n '3p')"
+pending_is_ours=0
+if [ "$pending_generation" = "$expected_generation" ] && \
+   [ "$pending_session" = "$expected_session" ] && \
+   [ "$pending_dir" = "$event_dir" ]; then
+	pending_is_ours=1
+fi
+
+# Prefer ending only the Motion event actually bound to this synthetic trigger.
+# If no movie ever bound and the pending marker is still ours, issue a fail-safe
+# eventend anyway. prepare_synthetic_event guaranteed Motion was idle before
+# eventstart, so this clears a potentially stuck event_user/user-event latch
+# without relying on on_movie_start/on_event_start callbacks having succeeded.
+if ct_motion_session_is_current "$expected_session"; then
+	ended=0
+	if [ -d "$event_dir" ]; then
+		bound_id="$(ct_state_read "$event_dir" motion_event_id 2>/dev/null || true)"
+		active="$(ct_motion_event_active_read 2>/dev/null || true)"
+		active_session="$(printf '%s\n' "$active" | sed -n '1p')"
+		active_id="$(printf '%s\n' "$active" | sed -n '2p')"
+		if ct_is_uint "$bound_id" && [ "$active_session" = "$expected_session" ] && [ "$active_id" = "$bound_id" ]; then
+			if ct_motion_action eventend; then
+				ended=1
+			else
+				sleep 1
+				if ct_motion_action eventend; then
+					ended=1
+				else
+					ct_log "failed to end forced synthetic video event $bound_id after retry"
+				fi
+			fi
+		fi
+	fi
+
+	if [ "$ended" -eq 0 ] && [ "$pending_is_ours" -eq 1 ]; then
+		ct_log "synthetic video did not bind in Motion session $expected_session; issuing fail-safe eventend"
+		if ! ct_motion_action eventend; then
+			sleep 1
+			ct_motion_action eventend || ct_log "fail-safe eventend failed in Motion session $expected_session"
+		fi
 	fi
 fi
 ct_audio_record_stop "$event_dir"

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.8-r3 - 2026-09-29
+
+- Added a fail-safe `eventend` for synthetic timer/audio/MQTT video requests that were accepted by Motion webcontrol but never reached `on_movie_start` binding.
+- This prevents Motion's webcontrol user-event state from remaining latched after a failed synthetic movie start and repeatedly feeding `on_motion_detected` callbacks after the normal Camera Tracer holdoff expires.
+- The normal bound-event path remains ownership-safe: a successfully bound synthetic clip still ends only its own Motion event id; the fail-safe is used only while the exact generation/session/event pending marker is still unconsumed.
+- Added static regression coverage for the unbound-synthetic fail-safe path.
+
 ## 0.6.8 - 2026-09-26
 
 - Repository examples are now service-neutral: the bundled shell hook targets a reserved `.invalid` HTTP endpoint and contains no vendor-specific integration.
