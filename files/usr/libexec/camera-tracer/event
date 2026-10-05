@@ -213,12 +213,19 @@ case "$source_type" in
 			# on_event_end callback before issuing eventstart. This makes timer,
 			# audio and MQTT video independent of Motion's long-lived event state.
 			if ct_motion_prepare_synthetic_event "$motion_session" "$source_type" && \
+				ct_synthetic_active_write "$generation" "$motion_session" "$event_dir" && \
 				ct_synthetic_pending_write "$generation" "$motion_session" "$event_dir" && \
 				ct_motion_action eventstart; then
 				/usr/libexec/camera-tracer/synthetic-video-stop \
 					"$generation" "$motion_session" "$event_dir" "$video_max_time" >/dev/null 2>&1 &
 			else
 				ct_log "$source_type trigger accepted but a fresh Motion video event could not be started; continuing with photo only"
+				# An HTTP failure can race with Motion receiving eventstart. Keep a
+				# stop worker for an armed owner even if no movie can be delivered.
+				if ct_synthetic_active_owned "$generation" "$motion_session" "$event_dir"; then
+					/usr/libexec/camera-tracer/synthetic-video-stop \
+						"$generation" "$motion_session" "$event_dir" 1 >/dev/null 2>&1 &
+				fi
 				ct_audio_record_stop "$event_dir"
 				rm -f "$CT_BASE/synthetic-video-pending"
 				rm -rf "$event_dir"

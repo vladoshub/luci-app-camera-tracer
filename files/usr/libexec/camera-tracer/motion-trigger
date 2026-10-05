@@ -6,6 +6,8 @@
 BASE='/tmp/camera_tracer'
 motion_session="${1:-}"
 event_id="${2:-}"
+diff_pixels="${3:-}"
+pixel_threshold="${4:-}"
 
 case "$motion_session" in
 	''|*[!A-Za-z0-9._-]*) exit 0 ;;
@@ -14,11 +16,28 @@ case "$event_id" in
 	''|*[!0-9]*) exit 0 ;;
 esac
 
+# Motion also calls on_motion_detected for webcontrol eventstart, even when
+# nothing moved. %D carries actual changed pixels; event_user does not change
+# this count. Require the same strict threshold comparison as natural Motion.
+case "$diff_pixels" in ''|*[!0-9]*) exit 0 ;; esac
+case "$pixel_threshold" in ''|*[!0-9]*) exit 0 ;; esac
+[ "$diff_pixels" -gt "$pixel_threshold" ] 2>/dev/null || exit 0
+
 # Ignore callbacks from a Motion process that was superseded by a trusted-device
 # pause/resume or another Motion restart.
 current_session=''
 [ -r "$BASE/motion-session" ] && read -r current_session < "$BASE/motion-session" || true
 [ "$current_session" = "$motion_session" ] || exit 0
+
+# Synthetic movies keep their original timer/audio/MQTT source. The marker is
+# armed before eventstart and survives movie splitting/finalization.
+if [ -r "$BASE/synthetic-video-active" ]; then
+	{
+		read -r synthetic_generation
+		read -r synthetic_session
+	} < "$BASE/synthetic-video-active"
+	[ "$synthetic_session" = "$motion_session" ] && exit 0
+fi
 
 # Runtime motion control is mirrored into tmpfs by Camera Tracer. Check it here
 # so motion=off does not turn continuous scene motion into a stream of heavier

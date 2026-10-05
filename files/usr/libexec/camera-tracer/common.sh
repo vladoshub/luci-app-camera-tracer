@@ -274,6 +274,7 @@ ct_media_event_active() {
 	generation="$(cat "$CT_BASE/generation" 2>/dev/null)"
 	motion_session="$(ct_motion_session_read 2>/dev/null || true)"
 	[ -n "$generation" ] && [ -n "$motion_session" ] || return 1
+	ct_synthetic_active_current && return 0
 
 	pending="$(ct_synthetic_pending_read 2>/dev/null || true)"
 	pending_generation="$(printf '%s\n' "$pending" | sed -n '1p')"
@@ -309,7 +310,7 @@ ct_abandon_active_media() {
 	local generation motion_session dir state_session
 	generation="$(cat "$CT_BASE/generation" 2>/dev/null)"
 	motion_session="$(ct_motion_session_read 2>/dev/null || true)"
-	rm -f "$CT_BASE/synthetic-video-pending" "$CT_BASE/audio-record-active"
+	rm -f "$CT_BASE/synthetic-video-pending" "$CT_BASE/synthetic-video-active" "$CT_BASE/audio-record-active"
 	rm -rf "$CT_BASE/audio-record-control.lock" "$CT_BASE/synthetic-video-bind.lock"
 
 	[ -n "$generation" ] && [ -n "$motion_session" ] && [ -d "$CT_STATE/$generation" ] || return 0
@@ -452,6 +453,13 @@ ct_reserve_event() {
 	mkdir -p "$CT_BASE" "$CT_RAW" "$CT_STATE"
 	mkdir "$CT_BASE/reserve.lock" 2>/dev/null || return 1
 
+	# A manually short holdoff must not let another source replace a synthetic
+	# user-event owner while Motion is still recording it.
+	if ct_synthetic_active_current; then
+		rmdir "$CT_BASE/reserve.lock" 2>/dev/null || true
+		return 1
+	fi
+
 	now="$(date +%s)"
 	next=0
 	[ -r "$CT_BASE/next_allowed" ] && read -r next < "$CT_BASE/next_allowed"
@@ -535,31 +543,78 @@ ct_motion_action() {
 		"http://127.0.0.1:${CT_WEBCONTROL_PORT}/0/action/${action}" >/dev/null 2>&1
 }
 
-ct_synthetic_pending_write() {
-	local generation="$1" motion_session="$2" event_dir="$3" tmp
+ct_synthetic_marker_write() {
+	local kind="$1" generation="$2" motion_session="$3" event_dir="$4" event_id="${5:-}" tmp
+	case "$kind" in pending|active) ;; *) return 1 ;; esac
 	mkdir -p "$CT_BASE"
-	tmp="$CT_BASE/.synthetic-video-pending.tmp.$$"
+	tmp="$CT_BASE/.synthetic-video-${kind}.tmp.$$"
 	{
 		printf '%s\n' "$generation"
 		printf '%s\n' "$motion_session"
 		printf '%s\n' "$event_dir"
+		printf '%s\n' "$event_id"
 	} > "$tmp" || return 1
-	mv -f "$tmp" "$CT_BASE/synthetic-video-pending"
+	mv -f "$tmp" "$CT_BASE/synthetic-video-$kind"
 }
 
-ct_synthetic_pending_read() {
-	local line=0 generation='' motion_session='' event_dir=''
-	[ -r "$CT_BASE/synthetic-video-pending" ] || return 1
+ct_synthetic_marker_read() {
+	local kind="$1" line=0 generation='' motion_session='' event_dir='' event_id='' value
+	case "$kind" in pending|active) ;; *) return 1 ;; esac
+	[ -r "$CT_BASE/synthetic-video-$kind" ] || return 1
 	while IFS= read -r value; do
 		line=$((line + 1))
 		case "$line" in
 			1) generation="$value" ;;
 			2) motion_session="$value" ;;
-			3) event_dir="$value"; break ;;
+			3) event_dir="$value" ;;
+			4) event_id="$value"; break ;;
 		esac
-	done < "$CT_BASE/synthetic-video-pending"
+	done < "$CT_BASE/synthetic-video-$kind"
 	[ -n "$generation" ] && [ -n "$motion_session" ] && [ -n "$event_dir" ] || return 1
 	printf '%s\n%s\n%s\n' "$generation" "$motion_session" "$event_dir"
+	[ -z "$event_id" ] || printf '%s\n' "$event_id"
+	return 0
+}
+
+ct_synthetic_pending_write() {
+	ct_synthetic_marker_write pending "$1" "$2" "$3"
+}
+
+ct_synthetic_pending_read() {
+	ct_synthetic_marker_read pending
+}
+
+# Unlike the pending movie binding, this marker belongs to Motion's event_user
+# latch. movie-end may delete the media directory at movie_max_time, but must
+# never delete the ownership needed by the stop worker to reset event_user.
+ct_synthetic_active_write() {
+	ct_synthetic_marker_write active "$1" "$2" "$3" "${4:-}"
+}
+
+ct_synthetic_active_read() {
+	ct_synthetic_marker_read active
+}
+
+ct_synthetic_active_owned() {
+	local marker
+	marker="$(ct_synthetic_active_read 2>/dev/null)" || return 1
+	[ "$(printf '%s\n' "$marker" | sed -n '1p')" = "$1" ] &&
+		[ "$(printf '%s\n' "$marker" | sed -n '2p')" = "$2" ] &&
+		[ "$(printf '%s\n' "$marker" | sed -n '3p')" = "$3" ]
+}
+
+ct_synthetic_active_clear() {
+	ct_synthetic_active_owned "$1" "$2" "$3" || return 0
+	rm -f "$CT_BASE/synthetic-video-active"
+}
+
+ct_synthetic_active_current() {
+	local marker generation motion_session
+	marker="$(ct_synthetic_active_read 2>/dev/null)" || return 1
+	generation="$(printf '%s\n' "$marker" | sed -n '1p')"
+	motion_session="$(printf '%s\n' "$marker" | sed -n '2p')"
+	[ "$generation" = "$(cat "$CT_BASE/generation" 2>/dev/null)" ] &&
+		ct_motion_session_is_current "$motion_session"
 }
 
 ct_audio_record_active_write() {

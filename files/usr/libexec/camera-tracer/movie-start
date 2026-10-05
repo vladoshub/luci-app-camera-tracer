@@ -38,6 +38,9 @@ tmp_map="$map_file.tmp.$$"
 printf '%s\n' "$pending_dir" > "$tmp_map" || exit 0
 mv -f "$tmp_map" "$map_file" || exit 0
 ct_state_write "$pending_dir" motion_event_id "$event_id" || exit 0
+if ct_synthetic_active_owned "$generation" "$motion_session" "$pending_dir"; then
+	ct_synthetic_active_write "$generation" "$motion_session" "$pending_dir" "$event_id" || exit 0
+fi
 rm -f "$CT_BASE/synthetic-video-pending"
 source_type="$(ct_state_read "$pending_dir" source 2>/dev/null || true)"
 [ -n "$source_type" ] || source_type='synthetic'

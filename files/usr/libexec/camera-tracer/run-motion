@@ -68,7 +68,7 @@ motion_session="$(date +%s)-$$"
 tmp_session="$CT_BASE/.motion-session.tmp.$$"
 printf '%s\n' "$motion_session" > "$tmp_session" || exit 1
 mv -f "$tmp_session" "$CT_BASE/motion-session" || exit 1
-rm -f "$CT_BASE/motion-event-active"
+rm -f "$CT_BASE/motion-event-active" "$CT_BASE/synthetic-video-active" "$CT_BASE/synthetic-video-pending"
 rm -rf "$CT_BASE/synthetic-video-bind.lock"
 
 # Synthetic triggers (audio/timer/MQTT message) all use Motion's localhost
@@ -112,7 +112,7 @@ movie_max_time $video_max_time
 movie_filename clip-%v-%Y%m%d-%H%M%S
 on_event_start /usr/libexec/camera-tracer/motion-event-start $motion_session %v
 on_event_end /usr/libexec/camera-tracer/motion-event-end $motion_session %v
-on_motion_detected /usr/libexec/camera-tracer/motion-trigger $motion_session %v
+on_motion_detected /usr/libexec/camera-tracer/motion-trigger $motion_session %v %D $threshold
 on_movie_start /usr/libexec/camera-tracer/movie-start $motion_session %f %v
 on_movie_end /usr/libexec/camera-tracer/movie-end $motion_session %f %v
 webcontrol_port $webcontrol_port

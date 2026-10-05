@@ -17,7 +17,8 @@ start_service() {
 
 	mkdir -p /tmp/camera_tracer/raw /tmp/camera_tracer/state /tmp/camera_tracer/control
 	rm -f /tmp/camera_tracer/reserve.lock /tmp/camera_tracer/next_allowed \
-		/tmp/camera_tracer/synthetic-video-pending /tmp/camera_tracer/audio-record-active \
+		/tmp/camera_tracer/synthetic-video-pending /tmp/camera_tracer/synthetic-video-active \
+		/tmp/camera_tracer/audio-record-active \
 		/tmp/camera_tracer/audio-worker-ready /tmp/camera_tracer/camera-paused \
 		/tmp/camera_tracer/motion-session /tmp/camera_tracer/motion-event-active
 	rm -rf /tmp/camera_tracer/synthetic-video-bind.lock \
@@ -137,6 +138,7 @@ start_service() {
 stop_service() {
 	rm -f /tmp/camera_tracer/generation /tmp/camera_tracer/audio-record-active \
 		/tmp/camera_tracer/audio-worker-ready /tmp/camera_tracer/synthetic-video-pending \
+		/tmp/camera_tracer/synthetic-video-active \
 		/tmp/camera_tracer/camera-paused /tmp/camera_tracer/motion-session \
 		/tmp/camera_tracer/motion-event-active
 	rm -rf /tmp/camera_tracer/control /tmp/camera_tracer/synthetic-video-bind.lock \

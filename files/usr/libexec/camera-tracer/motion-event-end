@@ -5,5 +5,13 @@
 motion_session="${1:-}"
 event_id="${2:-}"
 ct_is_uint "$event_id" || exit 0
+synthetic="$(ct_synthetic_active_read 2>/dev/null || true)"
+synthetic_generation="$(printf '%s\n' "$synthetic" | sed -n '1p')"
+synthetic_session="$(printf '%s\n' "$synthetic" | sed -n '2p')"
+synthetic_dir="$(printf '%s\n' "$synthetic" | sed -n '3p')"
+synthetic_id="$(printf '%s\n' "$synthetic" | sed -n '4p')"
+if [ "$synthetic_session" = "$motion_session" ] && [ "$synthetic_id" = "$event_id" ]; then
+	ct_synthetic_active_clear "$synthetic_generation" "$synthetic_session" "$synthetic_dir"
+fi
 ct_motion_event_active_clear "$motion_session" "$event_id"
 exit 0

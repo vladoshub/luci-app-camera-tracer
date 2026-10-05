@@ -32,37 +32,40 @@ if [ "$pending_generation" = "$expected_generation" ] && \
 	pending_is_ours=1
 fi
 
-# Prefer ending only the Motion event actually bound to this synthetic trigger.
-# If no movie ever bound and the pending marker is still ours, issue a fail-safe
-# eventend anyway. prepare_synthetic_event guaranteed Motion was idle before
-# eventstart, so this clears a potentially stuck event_user/user-event latch
-# without relying on on_movie_start/on_event_start callbacks having succeeded.
-if ct_motion_session_is_current "$expected_session"; then
-	ended=0
-	if [ -d "$event_dir" ]; then
-		bound_id="$(ct_state_read "$event_dir" motion_event_id 2>/dev/null || true)"
+# Event-user ownership is independent of both pending binding and media state.
+# movie_max_time can close the first MP4 and movie-end can remove event_dir
+# before this deadline. A consumed pending marker is not evidence of eventend.
+ended=0
+if ct_motion_session_is_current "$expected_session" && \
+   ct_synthetic_active_owned "$expected_generation" "$expected_session" "$event_dir"; then
+	synthetic="$(ct_synthetic_active_read 2>/dev/null || true)"
+	bound_id="$(printf '%s\n' "$synthetic" | sed -n '4p')"
+	should_end=1
+	if ct_is_uint "$bound_id"; then
 		active="$(ct_motion_event_active_read 2>/dev/null || true)"
 		active_session="$(printf '%s\n' "$active" | sed -n '1p')"
 		active_id="$(printf '%s\n' "$active" | sed -n '2p')"
-		if ct_is_uint "$bound_id" && [ "$active_session" = "$expected_session" ] && [ "$active_id" = "$bound_id" ]; then
-			if ct_motion_action eventend; then
-				ended=1
-			else
-				sleep 1
-				if ct_motion_action eventend; then
-					ended=1
-				else
-					ct_log "failed to end forced synthetic video event $bound_id after retry"
-				fi
-			fi
+		if [ "$active_session" = "$expected_session" ] && ct_is_uint "$active_id" && [ "$active_id" != "$bound_id" ]; then
+			# A later natural event must not be ended by this old worker even
+			# if its earlier on_event_end callback was lost.
+			should_end=0
+			ct_synthetic_active_clear "$expected_generation" "$expected_session" "$event_dir"
 		fi
 	fi
 
-	if [ "$ended" -eq 0 ] && [ "$pending_is_ours" -eq 1 ]; then
-		ct_log "synthetic video did not bind in Motion session $expected_session; issuing fail-safe eventend"
-		if ! ct_motion_action eventend; then
+	if [ "$should_end" -eq 1 ]; then
+		if [ "$pending_is_ours" -eq 1 ]; then
+			ct_log "synthetic video did not bind in Motion session $expected_session; issuing fail-safe eventend"
+		fi
+		if ct_motion_action eventend; then
+			ended=1
+		else
 			sleep 1
-			ct_motion_action eventend || ct_log "fail-safe eventend failed in Motion session $expected_session"
+			if ct_motion_action eventend; then
+				ended=1
+			else
+				ct_log "failed to end forced synthetic video event ${bound_id:-unbound} after retry; retaining user-event owner"
+			fi
 		fi
 	fi
 fi
@@ -73,6 +76,11 @@ ct_audio_record_stop "$event_dir"
 # marker and deliver the accepted event to the local hook with its photo instead
 # of waiting forever for an MP4 that does not exist.
 sleep 3
+if [ "$ended" -eq 1 ]; then
+	# on_event_end normally clears this immediately. Also release it after the
+	# drain grace if that callback was lost, without touching a newer owner.
+	ct_synthetic_active_clear "$expected_generation" "$expected_session" "$event_dir"
+fi
 pending="$(ct_synthetic_pending_read 2>/dev/null || true)"
 pending_generation="$(printf '%s\n' "$pending" | sed -n '1p')"
 pending_session="$(printf '%s\n' "$pending" | sed -n '2p')"

@@ -331,6 +331,11 @@ grep -Fq 'synthetic video did not bind in Motion session $expected_session; issu
 grep -Fq 'ct_motion_action eventend' files/usr/libexec/camera-tracer/synthetic-video-stop || fail "synthetic fail-safe eventend"
 pass "synthetic fail-safe eventend"
 
+# Exercise the real callback scripts, including movie_max_time finalization
+# before the stop worker, static-frame callbacks and source/session isolation.
+python3 tests/synthetic-trigger-check.py || fail "synthetic trigger behavior"
+pass "synthetic trigger behavior"
+
 # Verify runtime trigger state and the dependency-free MQTT control payload grammar.
 cat > "$TMP/control-test.sh" <<'EOS'
 #!/bin/sh
