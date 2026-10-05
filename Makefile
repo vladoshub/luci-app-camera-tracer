@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-camera-tracer
-PKG_VERSION:=0.6.8
+PKG_VERSION:=0.6.9
 PKG_RELEASE:=3
 PKG_LICENSE:=GPL-2.0-or-later
 PKG_LICENSE_FILES:=LICENSE
